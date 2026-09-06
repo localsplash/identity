@@ -12,7 +12,12 @@ COPY --from=build /app/package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY public ./public
-RUN addgroup -S app && adduser -S app -G app && chown -R app:app /app
+# /data holds config.json — the address of the settings store, written by
+# the first-run wizard. Created here so the named volume mounted over it
+# inherits this ownership and the unprivileged runtime user can write it.
+RUN addgroup -S app && adduser -S app -G app \
+ && mkdir -p /data \
+ && chown -R app:app /app /data
 USER app
 EXPOSE 3200
 HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -qO- http://127.0.0.1:3200/healthz || exit 1

@@ -32,20 +32,11 @@ import { AppConfig } from './config';
  */
 
 /**
- * This service's base and table are named, not configured: `IdentityBase`,
- * holding `auth_tbl_Settings`.
- *
- * It is the only NocoDB base on the platform. The Echo applications keep
- * their settings in the Echo database, next to the data they describe; what
- * they read from here is `trustedCIDR`, the network policy that identity and
- * every application have to agree on, and which therefore has to live
- * somewhere all of them can reach before their own database is up.
- *
- * A base name is unique because we say it is — NocoDB does not enforce it —
- * which is what lets an application find the base by name at runtime instead
- * of carrying an ID that survives a rename and outlives a restore. A second
- * base would be named for whatever it holds, and only if something genuinely
- * needs one.
+ * The base and table are named by convention, not configured: one base per
+ * repository, `{Repo}Base`, holding `auth_tbl_Settings`. A base name is
+ * unique because we say it is — NocoDB does not enforce it — which is what
+ * lets an application find its own base by name at runtime instead of
+ * carrying a base ID that survives a rename and outlives a restore.
  */
 export const SETTINGS_BASE_NAME = 'IdentityBase';
 export const SETTINGS_TABLE_NAME = 'auth_tbl_Settings';
@@ -152,7 +143,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'UISP_CRM_APP_KEY_READ',
     description:
-      'Read-only UISP CRM App Key. Used by applications (e.g. EchoWeb) to look up ' +
+      'Read-only UISP CRM App Key. Used by applications to look up ' +
       'subscriber records when provisioning accounts.',
   },
 ];
@@ -295,9 +286,9 @@ export class SettingsStore {
     return resp.json() as Promise<T>;
   }
 
-  /** True when an API token is present in the environment at all. */
+  /** True when this app has both halves of the store's address. */
   isConfigured(): boolean {
-    return Boolean(this.config.NOCODB_API_TOKEN);
+    return Boolean(this.config.NOCODB_BASE_URL && this.config.NOCODB_API_TOKEN);
   }
 
   /**

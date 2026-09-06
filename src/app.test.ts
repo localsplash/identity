@@ -230,13 +230,7 @@ vi.mock('./store', () => {
 
 import { buildApp } from './app';
 
-const ENV_KEYS = [
-  'IDENTITY_APP_AUTH_MODE',
-  'IDENTITY_TRUSTED_PROXY_CIDRS',
-  'ID_APP_AUTH_MODE',
-  'ID_TRUSTED_PROXY_CIDRS',
-  'NODE_ENV',
-] as const;
+const ENV_KEYS = ['IDENTITY_APP_AUTH_MODE', 'ID_APP_AUTH_MODE', 'NODE_ENV'] as const;
 
 /**
  * `trustedCIDR` is a setting, not an environment variable — one value for
@@ -272,7 +266,9 @@ function seedSession(params: { iUserId: number; bSuperAdmin: boolean; email: str
   return sSessionId;
 }
 
-// supertest connects over loopback, so 127.0.0.1/32 = "caller is trusted".
+// supertest connects over loopback. That is a private peer, so the app reads
+// X-Forwarded-For on these requests exactly as it would behind a proxy —
+// which is what lets these tests present a client address at all.
 const LOOPBACK = '127.0.0.1/32';
 const ELSEWHERE = '10.9.0.0/16';
 const REDIRECT = 'https://app.wisp.net/auth/callback';
@@ -290,11 +286,7 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
   });
 
   it('allows a peer inside a subnet range', async () => {
-    // Trusted-proxy loopback lets the test present a subnet client address.
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
-    });
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.44.5');
     expect(res.status).toBe(200);
   });
@@ -313,28 +305,31 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
     expect(res.status).toBe(403);
   });
 
-  it('ignores a spoofed X-Forwarded-For when the peer is not a trusted proxy', async () => {
+  /**
+   * The anti-spoof case that matters in production. A proxy appends the peer
+   * it saw (nginx's $proxy_add_x_forwarded_for), so a caller off the internet
+   * claiming to be inside the trusted network still has its own public
+   * address appended after the lie. The right-to-left walk finds that public
+   * hop first and reports it, and the claim buys nothing.
+   */
+  it('reports the public hop a proxy appended, not the private one claimed', async () => {
     const app = makeApp({ trustedCIDR: ELSEWHERE });
-    const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.0.5');
+    const res = await request(app)
+      .get('/api/events?since=0')
+      .set('X-Forwarded-For', '10.9.0.5, 203.0.113.9');
     expect(res.status).toBe(403);
   });
 
-  it('rejects IPv6/mapped forms smuggled through a trusted proxy header', async () => {
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
-    });
+  it('rejects IPv6/mapped forms smuggled through a forwarding header', async () => {
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     for (const spoof of ['::ffff:10.9.0.5', '2001:db8::1', 'garbage']) {
       const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', spoof);
       expect(res.status).toBe(403);
     }
   });
 
-  it('evaluates a reverse-proxy chain only across configured trusted hops', async () => {
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: `${LOOPBACK}, 172.16.0.0/24`,
-    });
+  it('evaluates a reverse-proxy chain across private hops only', async () => {
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     // client 10.9.0.5 → proxy 172.16.0.2 → loopback → id: allowed
     const ok = await request(app)
       .get('/api/events?since=0')

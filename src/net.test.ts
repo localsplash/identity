@@ -7,6 +7,7 @@ import {
   ipInCidrs,
   socketPeerIpv4,
   resolveClientIp,
+  isPrivateIpv4,
   formatIpv4,
 } from './net';
 
@@ -94,48 +95,70 @@ describe('socketPeerIpv4', () => {
 });
 
 describe('resolveClientIp', () => {
-  const proxies = parseCidrList('172.16.0.0/24');
-
-  it('defaults to the socket peer and ignores X-Forwarded-For from an untrusted peer', () => {
-    const r = resolveClientIp(req('203.0.113.7', '10.9.0.5'), proxies);
+  it('a public peer is the client; its forwarding header is ignored', () => {
+    const r = resolveClientIp(req('203.0.113.7', '10.9.0.5'));
     expect(r).toEqual({ ip: '203.0.113.7', ipNum: parseIpv4('203.0.113.7'), forwarded: false });
   });
 
-  it('spoofed forwarding headers cannot bypass the policy without a trusted proxy', () => {
-    const r = resolveClientIp(req('203.0.113.7', '10.9.0.5, 172.16.0.1'), []);
-    expect(r?.ip).toBe('203.0.113.7');
-    expect(r?.forwarded).toBe(false);
+  it('a private peer with no header is itself the client', () => {
+    const r = resolveClientIp(req('10.9.0.5'));
+    expect(r).toEqual({ ip: '10.9.0.5', ipNum: parseIpv4('10.9.0.5'), forwarded: false });
+    expect(resolveClientIp(req('172.24.0.3', ''))?.ip).toBe('172.24.0.3');
   });
 
-  it('honours the forwarded client when the direct peer is a trusted proxy', () => {
-    const r = resolveClientIp(req('172.16.0.1', '10.9.0.5'), proxies);
+  it('honours the forwarded client when the peer is private (a proxy)', () => {
+    const r = resolveClientIp(req('172.24.0.3', '203.0.113.9'));
+    expect(r).toEqual({ ip: '203.0.113.9', ipNum: parseIpv4('203.0.113.9'), forwarded: true });
+  });
+
+  /**
+   * The spoof that the private-peer rule has to survive. A proxy appends the
+   * address it saw, so the forged private hop is followed by the caller's own
+   * public one; the right-to-left walk reports the public address.
+   */
+  it('cannot be talked into the private network from the outside', () => {
+    const r = resolveClientIp(req('172.24.0.3', '10.9.0.5, 203.0.113.9'));
+    expect(r?.ip).toBe('203.0.113.9');
+    expect(isPrivateIpv4(r!.ipNum)).toBe(false);
+  });
+
+  it('walks right-to-left across private hops to the first public one', () => {
+    const r = resolveClientIp(req('172.24.0.3', '198.51.100.9, 10.0.0.4, 192.168.1.1'));
+    expect(r?.ip).toBe('198.51.100.9');
+    // An attacker-prepended hop before the real client is NOT the answer.
+    const r2 = resolveClientIp(req('172.24.0.3', '1.2.3.4, 198.51.100.9, 10.0.0.4'));
+    expect(r2?.ip).toBe('198.51.100.9');
+  });
+
+  it('treats an all-private chain as the leftmost hop (internal caller)', () => {
+    // app 10.9.0.5 → nginx 172.24.0.3 → identity
+    const r = resolveClientIp(req('172.24.0.3', '10.9.0.5'));
     expect(r).toEqual({ ip: '10.9.0.5', ipNum: parseIpv4('10.9.0.5'), forwarded: true });
-  });
-
-  it('walks a proxy chain right-to-left across trusted hops only', () => {
-    // client 10.9.0.5 → proxy 172.16.0.2 → proxy 172.16.0.1 → id
-    const r = resolveClientIp(req('172.16.0.1', '10.9.0.5, 172.16.0.2'), proxies);
-    expect(r?.ip).toBe('10.9.0.5');
-    // The attacker-prepended hop before the real client is NOT the answer.
-    const r2 = resolveClientIp(req('172.16.0.1', '1.2.3.4, 10.9.0.5, 172.16.0.2'), proxies);
-    expect(r2?.ip).toBe('10.9.0.5');
+    const chained = resolveClientIp(req('172.24.0.3', '10.9.0.5, 192.168.1.1'));
+    expect(chained?.ip).toBe('10.9.0.5');
   });
 
   it('rejects malformed, IPv6, or mapped entries in the forwarded chain', () => {
-    expect(resolveClientIp(req('172.16.0.1', '::ffff:10.9.0.5'), proxies)).toBeNull();
-    expect(resolveClientIp(req('172.16.0.1', '2001:db8::1'), proxies)).toBeNull();
-    expect(resolveClientIp(req('172.16.0.1', 'garbage'), proxies)).toBeNull();
-    expect(resolveClientIp(req('172.16.0.1', ''), proxies)?.ip).toBe('172.16.0.1');
+    expect(resolveClientIp(req('172.24.0.3', '::ffff:10.9.0.5'))).toBeNull();
+    expect(resolveClientIp(req('172.24.0.3', '2001:db8::1'))).toBeNull();
+    expect(resolveClientIp(req('172.24.0.3', 'garbage'))).toBeNull();
   });
 
   it('rejects a real-IPv6 socket peer deterministically', () => {
-    expect(resolveClientIp(req('2001:db8::5', '10.9.0.5'), proxies)).toBeNull();
-    expect(resolveClientIp(req(undefined), proxies)).toBeNull();
+    expect(resolveClientIp(req('2001:db8::5', '10.9.0.5'))).toBeNull();
+    expect(resolveClientIp(req(undefined))).toBeNull();
   });
+});
 
-  it('treats an all-proxy chain as the leftmost proxy (NAT edge)', () => {
-    const r = resolveClientIp(req('172.16.0.1', '172.16.0.9'), proxies);
-    expect(r?.ip).toBe('172.16.0.9');
+describe('isPrivateIpv4', () => {
+  it('covers RFC1918, loopback and link-local, and nothing routable', () => {
+    for (const ip of ['10.0.0.1', '172.16.0.1', '172.24.0.3', '172.31.255.255',
+                      '192.168.1.1', '127.0.0.1', '169.254.1.1']) {
+      expect(isPrivateIpv4(parseIpv4(ip)!)).toBe(true);
+    }
+    for (const ip of ['203.0.113.7', '8.8.8.8', '172.15.0.1', '172.32.0.1', '192.169.0.1']) {
+      expect(isPrivateIpv4(parseIpv4(ip)!)).toBe(false);
+    }
   });
 });
 

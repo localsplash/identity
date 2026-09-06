@@ -33,8 +33,69 @@
 
     <div id="errorBanner" class="hidden my-4 px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
 
+    <!--
+      The wizard is open to whoever reaches it. Say so plainly: on a service
+      that is reachable from the internet, the window between "it answers"
+      and "it is claimed" is a window in which someone else can claim it.
+    -->
+    <div class="my-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-900">
+      <div class="flex gap-2">
+        <svg class="w-5 h-5 flex-shrink-0 mt-0.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8">
+          <path stroke-linecap="round" stroke-linejoin="round" d="M12 9v4m0 4h.01M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z"/>
+        </svg>
+        <div>
+          <p class="font-semibold">Anyone who finishes this page becomes Super System Admin.</p>
+          <p class="mt-1 text-amber-800">
+            This instance is unclaimed, so this wizard is open to every visitor
+            who can reach it — it closes for good the moment one sign-in method
+            is configured. If this service is reachable from the internet,
+            finish now rather than later, and confirm afterwards on
+            <span class="font-mono text-xs">/admin</span> that the only Super
+            System Admin is you.
+          </p>
+        </div>
+      </div>
+    </div>
+
     <!-- A store is not usable: setup cannot save anything -->
     <div id="storeBlock" class="hidden my-4 px-4 py-3 rounded-xl bg-amber-50 border border-amber-200 text-sm text-amber-800"></div>
+
+    <!-- Step 1: where the settings store is. Shown only before it is known. -->
+    <form id="bootstrapForm" class="hidden mt-6 space-y-4">
+      <p class="text-sm text-slate-600">
+        First, where this service keeps its settings. Everything else it needs
+        lives in a NocoDB base called
+        <span class="font-mono text-xs">IdentityBase</span>, which is created
+        for you if it does not exist yet.
+      </p>
+      <div id="bootstrapError" class="hidden px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">NocoDB URL</label>
+        <input id="nocodbBaseUrl" type="text" required placeholder="https://nocodb.example.com"
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">NocoDB API token</label>
+        <input id="nocodbApiToken" type="password" required placeholder="nc_pat_…"
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p class="text-xs text-slate-400 mt-1">Generate one in NocoDB under Account → Tokens.</p>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-500 mb-1">Trusted network (IPv4 CIDR)</label>
+        <input id="trustedCIDR" type="text" required placeholder="10.9.0.0/16"
+          class="w-full px-3 py-2 rounded-xl border border-slate-200 text-sm font-mono" />
+        <p class="text-xs text-slate-400 mt-1">
+          The network your application servers sit on. Only callers inside it may
+          use the server-only APIs — token issue, app registration, the user
+          directory. A comma-separated list is accepted; a bare address means
+          just that host. There is deliberately no default.
+        </p>
+      </div>
+      <button type="submit" id="bootstrapBtn"
+        class="w-full py-2.5 rounded-xl bg-slate-800 text-white text-sm font-semibold hover:bg-slate-900 transition">
+        Save and restart
+      </button>
+    </form>
 
     <!-- Step 0: where the identity data lives. Shown only when unset. -->
     <form id="dbForm" class="hidden mt-6 space-y-4">
@@ -337,6 +398,18 @@
       .then((r) => r.json())
       .then((s) => {
         if (!s.unclaimed) { location.href = '/'; return; }
+        if (s.step === 'bootstrap') {
+          if (!s.configWritable) {
+            showStoreProblem(
+              (s.configPath || '/data/config.json') + ' is not writable, so this page ' +
+              'cannot save what you type. Mount a writable volume there, or set ' +
+              'NOCODB_BASE_URL and NOCODB_API_TOKEN in the environment instead.'
+            );
+            return;
+          }
+          document.getElementById('bootstrapForm').classList.remove('hidden');
+          return;
+        }
         // The settings store answered — reaching this page at all proves it,
         // since every other outcome is the 503 page with its own retry. So
         // the only store left to ask about is the identity database.
@@ -393,6 +466,67 @@
         document.getElementById('form').classList.remove('hidden');
         refreshProviderUi();
       });
+
+    document.getElementById('bootstrapForm').addEventListener('submit', async (e) => {
+      e.preventDefault();
+      const err = document.getElementById('bootstrapError');
+      const btn = document.getElementById('bootstrapBtn');
+      err.classList.add('hidden');
+      btn.disabled = true;
+      btn.textContent = 'Checking NocoDB…';
+      let r, data;
+      try {
+        r = await fetch('/api/setup/bootstrap', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            nocodbBaseUrl: document.getElementById('nocodbBaseUrl').value.trim(),
+            nocodbApiToken: document.getElementById('nocodbApiToken').value.trim(),
+            trustedCIDR: document.getElementById('trustedCIDR').value.trim(),
+          }),
+        });
+        data = await r.json().catch(() => ({}));
+      } catch (_) {
+        err.textContent = 'Could not reach this service. Is it still running?';
+        err.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Save and restart';
+        return;
+      }
+      if (!r.ok) {
+        err.textContent = data.error || 'Those settings could not be used.';
+        err.classList.remove('hidden');
+        btn.disabled = false;
+        btn.textContent = 'Save and restart';
+        return;
+      }
+      // The service is on its way down to come back up reading what we just
+      // wrote. Wait for it rather than showing the operator a dead page.
+      btn.textContent = 'Restarting…';
+      const backUp = async () => {
+        try {
+          const h = await fetch('/api/setup/status', { cache: 'no-store' });
+          const j = await h.json();
+          return j.step !== 'bootstrap';
+        } catch (_) {
+          return false;
+        }
+      };
+      let waited = 0;
+      const poll = setInterval(async () => {
+        waited += 1000;
+        if (await backUp()) { clearInterval(poll); location.reload(); return; }
+        if (waited >= 60000) {
+          clearInterval(poll);
+          err.textContent =
+            'Saved, but this service has not come back after a minute. Check that ' +
+            'the container is set to restart, then reload this page.';
+          err.classList.remove('hidden');
+          btn.disabled = false;
+          btn.textContent = 'Save and restart';
+        }
+      }, 1000);
+    });
 
     document.getElementById('dbForm').addEventListener('submit', async (e) => {
       e.preventDefault();

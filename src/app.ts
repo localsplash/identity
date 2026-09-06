@@ -17,6 +17,7 @@ import {
   PROVIDERS,
   getProvider,
   isProviderConfigured,
+  isUnclaimed,
   availableLoginMethods,
   isSuperAdmin,
   isTenantLocked,
@@ -52,6 +53,12 @@ import {
   isHostUnderDomain,
   IDENTITY_HOST_LABEL,
 } from './web';
+import {
+  LOCAL_CONFIG_PATH,
+  localConfigWritable,
+  restartToApplyConfig,
+  writeLocalConfig,
+} from './localConfig';
 import * as store from './store';
 import { parseCidrList, resolveClientIp, ipInCidrs } from './net';
 import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
@@ -166,8 +173,6 @@ export function buildApp() {
   // apps sharing an allowed egress IP can call the same endpoints, which is
   // accepted for the first-party POC on a controlled host. IDENTITY_APP_AUTH_MODE
   // keeps the legacy IDENTITY_CLIENT_SECRET check available during rollout.
-  const proxyCidrs = parseCidrList(config.IDENTITY_TRUSTED_PROXY_CIDRS);
-
   // trustedCIDR is one setting for the whole platform, so it is read per
   // request like every other setting — a change reaches every application
   // within one cache interval, with no restart and no per-app spelling of
@@ -186,14 +191,14 @@ export function buildApp() {
   function peerIsTrusted(req: express.Request, settings: Settings): boolean {
     const cidrs = trustedCidrs(settings);
     if (!cidrs.length) return false;
-    const peer = resolveClientIp(req, proxyCidrs);
+    const peer = resolveClientIp(req);
     return peer !== null && ipInCidrs(peer.ipNum, cidrs);
   }
 
   /** Generic 403; the specifics go to the log, keyed by a correlation id. */
   function denyUntrusted(req: express.Request, res: express.Response): void {
     const correlationId = store.generateId(8);
-    const peer = resolveClientIp(req, proxyCidrs);
+    const peer = resolveClientIp(req);
     logger.warn(
       { correlationId, peerIp: peer?.ip ?? null, forwarded: peer?.forwarded ?? false, path: req.path },
       '[trust] rejected server-endpoint call'
@@ -344,15 +349,6 @@ export function buildApp() {
     return iUserId;
   }
 
-  /**
-   * "Unclaimed" = no OAuth provider has working config yet, so nobody can
-   * sign in and nobody is Super System Admin. In that state the first-run
-   * setup wizard is open; the moment one provider is configured it closes.
-   */
-  function isUnclaimed(settings: Settings): boolean {
-    return !PROVIDERS.some((p) => isProviderConfigured(p, settings));
-  }
-
   // ── Basic pages ────────────────────────────────────────────────────────────
 
   app.get('/healthz', (_req, res) => {
@@ -386,6 +382,11 @@ export function buildApp() {
   });
 
   app.get('/', async (req, res) => {
+    // Before the store is named, the front door is the wizard. Asking the
+    // store first would answer the very first visit to a fresh install with
+    // the "settings unavailable" page — technically true, and useless: the
+    // page they need is the one that fixes it.
+    if (!settingsStore.isConfigured()) return res.redirect('/setup');
     const session = await resolveSession(req);
     if (session) return res.redirect('/account');
     const settings = await getSettings();
@@ -415,6 +416,11 @@ export function buildApp() {
   // ── First-run setup wizard ─────────────────────────────────────────────────
 
   app.get('/setup', async (_req, res) => {
+    // Before the store is named there is nothing to ask it, and this page is
+    // the only thing that can name it — so it renders without consulting it.
+    if (!settingsStore.isConfigured()) {
+      return res.sendFile(path.join(publicDir, 'setup.html'));
+    }
     const settings = await getSettings();
     if (!isUnclaimed(settings)) return res.redirect('/');
     return res.sendFile(path.join(publicDir, 'setup.html'));
@@ -422,6 +428,20 @@ export function buildApp() {
 
   app.get('/api/setup/status', async (req, res) => {
     settingsStore.invalidate();
+
+    // Step 1: the store has no address yet. Nothing below can run — every
+    // one of those questions is answered out of the store — so report the
+    // one thing that is true and let the wizard ask for it.
+    if (!settingsStore.isConfigured()) {
+      return res.json({
+        unclaimed: true,
+        step: 'bootstrap',
+        configPath: LOCAL_CONFIG_PATH,
+        configWritable: localConfigWritable(),
+        identityHostLabel: IDENTITY_HOST_LABEL,
+      });
+    }
+
     const settings = await getSettings();
 
     // Once claimed there is no wizard, and the diagnostics below name
@@ -459,21 +479,132 @@ export function buildApp() {
     // let anyone contradict) or a row already in the store.
     return res.json({
       unclaimed: isUnclaimed(settings),
+      step: 'claim',
       database: database.state,
       databaseHint: database.hint,
       pending,
       pinned: {
         appBaseUrl: normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true }) ?? '',
         parentDomain: settings.PARENT_DOMAIN ?? '',
+        trustedCIDR: settings.trustedCIDR ?? '',
       },
       locked: {
         appBaseUrl: settingsStore.isOverridden('APP_BASE_URL'),
         parentDomain: settingsStore.isOverridden('PARENT_DOMAIN'),
+        trustedCIDR: settingsStore.isOverridden('trustedCIDR'),
       },
+      // The claim cannot complete while this is empty. Step 1 asks for it,
+      // but an instance whose NocoDB address came from the environment never
+      // saw step 1 — so the claim has to ask, or nothing ever would.
+      needsTrustedCIDR: !settings.trustedCIDR && !settingsStore.isOverridden('trustedCIDR'),
       // The convention the wizard shows when it has to name an expected
       // shape ("identity.example.com") — the one default in this codebase.
       identityHostLabel: IDENTITY_HOST_LABEL,
     });
+  });
+
+  /**
+   * Step 1 of the wizard: where the settings store is, and which network is
+   * trusted.
+   *
+   * This is the only endpoint that runs before the app knows anything about
+   * itself, so it does its own validating rather than leaning on state that
+   * does not exist yet. Nothing is written until all of it holds:
+   *
+   *   - trustedCIDR parses, and is not empty. It is required here on
+   *     purpose. It is the one security decision that cannot be deferred to
+   *     a later screen, because the endpoints it guards exist the moment
+   *     this process listens, and a deployment that never comes back to set
+   *     it is a deployment that never notices it is open.
+   *   - The NocoDB address and token actually work: the base is found or
+   *     created and the settings table with it. A typo is a message on this
+   *     screen, not a restart loop the operator has to read logs to explain.
+   *
+   * trustedCIDR then goes to the store, not to the local file. It is ONE
+   * value for the whole platform — every application reads the same row —
+   * and a copy pinned inside this container would be a second answer that
+   * silently outranks it. The local file keeps only what the store cannot
+   * hold: the store's own address.
+   */
+  app.post('/api/setup/bootstrap', async (req, res, next) => {
+    try {
+      if (settingsStore.isConfigured()) {
+        return res.status(409).json({ error: 'This instance already knows where its settings live.' });
+      }
+      if (!localConfigWritable()) {
+        return res.status(503).json({
+          error:
+            `${LOCAL_CONFIG_PATH} is not writable, so this cannot be saved. Mount a ` +
+            'writable volume there, or set NOCODB_BASE_URL and NOCODB_API_TOKEN in ' +
+            "this app's environment instead.",
+        });
+      }
+
+      const body = (req.body ?? {}) as Record<string, string>;
+      const token = String(body.nocodbApiToken ?? '').trim();
+      const trustedCIDR = String(body.trustedCIDR ?? '').trim();
+      const baseUrlRaw = String(body.nocodbBaseUrl ?? '').trim();
+      const nocodbBaseUrl = normalizeBaseUrl(baseUrlRaw, { allowHttp: true });
+
+      if (!nocodbBaseUrl) {
+        return res.status(400).json({ error: 'Enter the NocoDB URL, e.g. https://nocodb.example.com.' });
+      }
+      if (!token) {
+        return res.status(400).json({ error: 'Enter a NocoDB API token (Account → Tokens).' });
+      }
+      if (!trustedCIDR) {
+        return res.status(400).json({
+          error:
+            'Enter the trusted network. It is what admits your application servers ' +
+            'to the server-only endpoints, and there is no safe default for it.',
+        });
+      }
+      try {
+        if (parseCidrList(trustedCIDR).length === 0) throw new Error('empty');
+      } catch (err) {
+        return res.status(400).json({
+          error:
+            `${String((err as Error).message).replace(/^Error: /, '')} — give one or more ` +
+            'IPv4 CIDRs, e.g. 10.9.0.0/16 or 203.0.113.7.',
+        });
+      }
+
+      // Prove the address before saving it. A store built on the candidate
+      // values, with no environment overrides, so this tests exactly what
+      // the next boot will use.
+      const candidate = new SettingsStore(
+        { ...config, NOCODB_BASE_URL: nocodbBaseUrl, NOCODB_API_TOKEN: token },
+        {}
+      );
+      try {
+        await candidate.bootstrap();
+      } catch (err) {
+        const reason = err instanceof SettingsUnavailableError ? err.reason : 'unreachable';
+        return res.status(400).json({
+          error: err instanceof Error ? err.message : String(err),
+          reason,
+        });
+      }
+
+      // The platform-wide row, written where every application reads it.
+      await candidate.set('trustedCIDR', trustedCIDR);
+
+      writeLocalConfig({ NOCODB_BASE_URL: nocodbBaseUrl, NOCODB_API_TOKEN: token });
+      logger.info(
+        { store: nocodbBaseUrl, configPath: LOCAL_CONFIG_PATH },
+        '[setup] settings store recorded; restarting to read it'
+      );
+
+      // The process read its configuration once, at boot. Rather than teach
+      // every holder of it to change its mind, exit and let the container
+      // come back — restart: unless-stopped makes that the shortest path to
+      // a process that is simply configured from the start.
+      res.json({ ok: true, restarting: true, configPath: LOCAL_CONFIG_PATH });
+      res.on('finish', () => restartToApplyConfig());
+      return undefined;
+    } catch (err) {
+      return next(err);
+    }
   });
 
   /**
@@ -619,6 +750,46 @@ export function buildApp() {
       const clientId = String(body.clientId ?? '').trim();
       const tenant = String(body.tenant ?? '').trim();
 
+      /**
+       * No instance becomes claimed without a trusted network.
+       *
+       * This is the same requirement step 1 makes, enforced again here
+       * because step 1 is skipped whenever the NocoDB address came from the
+       * environment. Without it, such an instance could be claimed with the
+       * network policy empty — and the boot check that is supposed to catch
+       * exactly that only refuses once the instance is already claimed,
+       * which is one restart too late to be any help.
+       *
+       * Only asked while it is missing: a value already in the store, or
+       * pinned in the environment, is left alone rather than offered up for
+       * an unauthenticated visitor to overwrite.
+       */
+      const settingsTrustedCIDR = String(settings.trustedCIDR ?? '').trim();
+      const needsTrustedCIDR =
+        !settingsTrustedCIDR && !settingsStore.isOverridden('trustedCIDR');
+      const trustedCIDR = needsTrustedCIDR
+        ? String(body.trustedCIDR ?? '').trim() || (inFlightTrustedCIDR(req) ?? '')
+        : '';
+      if (needsTrustedCIDR) {
+        if (!trustedCIDR) {
+          return res.status(400).json({
+            error:
+              'Enter the trusted network. Until it names a network, every ' +
+              'server-only endpoint refuses every caller, and no application ' +
+              'can obtain a token.',
+          });
+        }
+        try {
+          if (parseCidrList(trustedCIDR).length === 0) throw new Error('empty');
+        } catch (err) {
+          return res.status(400).json({
+            error:
+              `${String((err as Error).message).replace(/^Error: /, '')} — give one or ` +
+              'more IPv4 CIDRs, e.g. 10.9.0.0/16 or 203.0.113.7.',
+          });
+        }
+      }
+
       // Retrying with a corrected admin domain must not make the admin dig
       // the client secret out again: reuse the one from the pending claim
       // when the body omits it and the rest of the credentials match.
@@ -664,6 +835,7 @@ export function buildApp() {
         csrf: store.generateId(16),
         parentDomain,
         adminDomain: adminDomain || undefined,
+        trustedCIDR: trustedCIDR || undefined,
         appBaseUrl: resolvedBase.url,
         provider: providerId,
         clientId,
@@ -690,6 +862,11 @@ export function buildApp() {
   });
 
   /** The settings the wizard is proposing, before anything is saved. */
+  /** The trusted network from a claim already in flight, if there is one. */
+  function inFlightTrustedCIDR(req: express.Request): string | undefined {
+    return getSetupFromCookie(req)?.trustedCIDR;
+  }
+
   function candidateSettings(setup: SetupRequest): Settings {
     const candidate: Settings = {
       PARENT_DOMAIN: setup.parentDomain,
@@ -697,6 +874,7 @@ export function buildApp() {
     };
     // Only when it differs; otherwise the PARENT_DOMAIN default applies and
     // no redundant row is written.
+    if (setup.trustedCIDR) candidate.trustedCIDR = setup.trustedCIDR;
     if (setup.adminDomain && setup.adminDomain !== setup.parentDomain) {
       candidate.SUPERADMIN_DOMAIN = setup.adminDomain;
     }
