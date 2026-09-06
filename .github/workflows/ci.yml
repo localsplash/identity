@@ -22,11 +22,11 @@ jobs:
       - run: npm test
 
   migrations:
-    name: id_db migrations (clean install, upgrade, no-op)
+    name: Platform MySQL migrations and tenant authorization
     runs-on: ubuntu-latest
     services:
       mysql:
-        image: mysql:8
+        image: mysql:8.4
         env:
           MYSQL_ROOT_PASSWORD: citest
         ports:
@@ -41,7 +41,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx vitest run src/migrations.integration.test.ts
+      - run: npx vitest run src/migrations.integration.test.ts src/platform.integration.test.ts
         env:
           TEST_DB_URL: mysql://root:citest@127.0.0.1:3306/id_db_migration_test
 

@@ -60,6 +60,8 @@ import {
   writeLocalConfig,
 } from './localConfig';
 import * as store from './store';
+import { createAppSession, safeId } from './platform';
+import { installPlatformRoutes } from './platformRoutes';
 import { parseCidrList, resolveClientIp, ipInCidrs } from './net';
 import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
 
@@ -68,7 +70,7 @@ const publicDir = path.join(__dirname, '..', 'public');
 export function buildApp() {
   const config = loadConfig();
   const settingsStore = new SettingsStore(config);
-  const logger = pino({ level: config.LOG_LEVEL });
+  const logger = pino({ level: config.LOG_LEVEL, redact: ['req.headers.authorization', 'req.headers.cookie', 'req.headers[\"x-id-client-secret\"]', 'req.query.code', 'req.query.state', 'res.headers[\"set-cookie\"]', 'res.headers.location'] });
   // The MySQL coordinates are settings too, so the pool cannot be built
   // until the store has been read — it connects on first use instead.
   // getSettings() rather than the store directly, so an environment-pinned
@@ -78,7 +80,7 @@ export function buildApp() {
 
   app.use(express.json({ limit: '256kb' }));
   app.use(express.urlencoded({ extended: false }));
-  app.use(pinoHttp({ logger }));
+  app.use(pinoHttp({ logger, serializers: { req(req) { return {...req, url: String(req.url ?? '').split('?')[0]}; } } }));
   app.use(express.static(publicDir, { index: false }));
 
   /**
@@ -126,7 +128,7 @@ export function buildApp() {
   }
 
   /**
-   * Is id_db usable? The coordinates are settings, so "not configured yet"
+   * Is platform_db usable? The coordinates are settings, so "not configured yet"
    * is an ordinary first-run state rather than a crash — and the wizard has
    * to be able to say which of the two stores is missing.
    */
@@ -139,7 +141,7 @@ export function buildApp() {
       return {
         state: 'unconfigured',
         hint:
-          'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
+          'The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
           `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, ` +
           "or set them in this app's environment, then restart.",
       };
@@ -1271,9 +1273,12 @@ export function buildApp() {
       if (!user) return res.status(400).json({ error: 'Unknown user' });
       const identities = await store.listIdentities(db, consumed.iUserId);
 
+      const appToken = await createAppSession(db, consumed, new URL(redirect_uri).origin);
+      res.set('Cache-Control', 'no-store');
       return res.json({
+        appSession: { token: appToken },
         user: {
-          iUserId: user.iUserId,
+          iUserId: safeId(user.iUserId),
           email: user.email,
           displayName: user.displayName,
           superAdmin: consumed.bSuperAdmin,
@@ -1370,7 +1375,9 @@ export function buildApp() {
     }
   });
 
-  // ── Central user directory (CIDR-trusted, server-only) ────────────────────
+  installPlatformRoutes(app, db, requireTrustedApp);
+
+  // ── Central user directory (trusted server + SUPER_ADMIN actor) ──────────
   //
   // Lets a trusted application (AidaAdmin) create, locate, and select
   // central users by iUserId without direct MySQL access or duplicate
@@ -1390,7 +1397,7 @@ export function buildApp() {
    */
   app.post('/api/directory/users', async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const body = (req.body ?? {}) as Record<string, string>;
       const email = String(body.email ?? '').trim().toLowerCase();
       if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) {
@@ -1398,7 +1405,7 @@ export function buildApp() {
       }
       const displayName = String(body.displayName ?? '').trim().slice(0, 255) || null;
       const idempotencyKey = String(body.idempotencyKey ?? '').trim().slice(0, 128) || null;
-      const user = await store.ensureDirectoryUser(db, { email, displayName, idempotencyKey });
+      const user = await store.ensureDirectoryUser(db, { email, displayName, idempotencyKey, actorUserId: res.locals.platformActor.iUserId });
       return res.json(user);
     } catch (err) {
       next(err);
@@ -1407,9 +1414,9 @@ export function buildApp() {
 
   app.get('/api/directory/users/:iUserId', async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const iUserId = Number(req.params.iUserId);
-      if (!Number.isInteger(iUserId) || iUserId <= 0) {
+      if (!Number.isSafeInteger(iUserId) || iUserId <= 0) {
         return res.status(400).json({ error: 'Invalid iUserId' });
       }
       const user = await store.getDirectoryUser(db, iUserId);
@@ -1422,14 +1429,14 @@ export function buildApp() {
 
   app.get('/api/directory/users', async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const query = String(req.query.query ?? '').trim().slice(0, 255);
       const limit = Number(req.query.limit ?? 25);
       const cursor = Number(req.query.cursor ?? 0);
-      if (!Number.isFinite(limit) || limit < 1 || limit > 100) {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
         return res.status(400).json({ error: 'limit must be between 1 and 100' });
       }
-      if (!Number.isFinite(cursor) || cursor < 0) {
+      if (!Number.isSafeInteger(cursor) || cursor < 0) {
         return res.status(400).json({ error: 'cursor must be a non-negative user id' });
       }
       const page = await store.searchDirectoryUsers(db, { query, limit, cursor });
@@ -1616,7 +1623,7 @@ export function buildApp() {
       }
       const value = String((req.body ?? {}).value ?? '');
       await settingsStore.set(key, value);
-      logger.warn(`[admin] user ${session.iUserId} set oAuthConfig ${key}`);
+      logger.warn(`[admin] user ${session.iUserId} set cfg_tbl_Setting ${key}`);
       return res.json({ ok: true });
     } catch (err) {
       next(err);
@@ -1777,6 +1784,7 @@ export function buildApp() {
         }
         return res.json({ error: err.message, reason: err.reason });
       }
+      if (err instanceof store.DirectoryConflictError) return res.status(409).json({error:err.message});
       res.status(500).json({ error: 'Internal server error' });
     }
   );

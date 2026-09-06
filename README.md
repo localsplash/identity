@@ -1,3 +1,7 @@
+# Consolidated platform foundation
+
+This branch implements the v2 central tenant and application-session contract in [docs/PLATFORM_CONTRACT.md](docs/PLATFORM_CONTRACT.md). It requires `PlatformConfig/cfg_tbl_Setting`; copy legacy settings and preserve the existing Identity database before deployment. The older operational notes below describe the deployed baseline and are superseded where they mention independent app sessions, CIDR-only directory access, or legacy settings names.
+
 # identity — OAuth identity processor & redirector
 
 `identity` is the single sign-in surface for every application under one parent

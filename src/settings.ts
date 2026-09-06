@@ -1,45 +1,12 @@
 import { AppConfig } from './config';
 
-/**
- * Settings live in NocoDB, not in the environment — with the environment
- * kept as an override for deployments that need to pin a value.
- *
- * The `oAuthConfig` table (base `id` by default) is a plain key/value store
- * that a Super System Admin can edit either through NocoDB itself at
- * nocodb.<parent-domain>, or through this app's /admin page. Every app under
- * the parent domain reads the same table with its own NocoDB API token, so
- * one set of credentials serves echo.X.TLD, aida.X.TLD, and whatever comes
- * next.
- *
- * Resolution order for every key below:
- *
- *   1. the process environment (`.env`) — an explicit override. A key set
- *      there wins over the store, is not writable from /admin, and is never
- *      copied into the store (it would go stale the moment the env changed).
- *   2. the `oAuthConfig` row — where the setup wizard and /admin write.
- *   3. nothing. There is deliberately no third place: a value that can be
- *      observed rather than configured (APP_BASE_URL, PARENT_DOMAIN) is
- *      derived from the URL the browser actually used to reach this service,
- *      at the point of use — see web.ts. The only assumption this codebase
- *      makes about that URL is the naming convention identity.X.TLD.
- *
- * On boot the table is created and seeded with every known key if it does
- * not exist yet, so the admin sees the full menu of settings rather than
- * having to guess key names. Seeded rows are left EMPTY on purpose — no
- * value is invented for a database that is still being created. Unknown
- * keys are kept — new applications may store their own settings here
- * without this app needing to learn about them.
- */
-
-/**
- * The base and table are named by convention, not configured: one base per
- * repository, `{Repo}Base`, holding `auth_tbl_Settings`. A base name is
- * unique because we say it is — NocoDB does not enforce it — which is what
- * lets an application find its own base by name at runtime instead of
- * carrying a base ID that survives a rename and outlives a restore.
- */
-export const SETTINGS_BASE_NAME = 'IdentityBase';
-export const SETTINGS_TABLE_NAME = 'auth_tbl_Settings';
+/** PlatformConfig is discovered by unique name; runtime reads never bootstrap.
+ * Resolution: nonblank environment override > identity > global '*'. Identity
+ * has no shared parent scope. Blank seed rows are unset, duplicate scoped keys
+ * are configuration errors, and secrets are never promoted to global scope. */
+export const SETTINGS_BASE_NAME = 'PlatformConfig';
+export const SETTINGS_TABLE_NAME = 'cfg_tbl_Setting';
+export const SETTINGS_SCOPE = 'identity';
 
 export interface SettingDef {
   key: string;
@@ -67,7 +34,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'DB_HOST',
     description:
-      'Hostname of the MySQL server holding id_db, the shared platform identity ' +
+      'Hostname of the MySQL server holding platform_db, the shared platform identity ' +
       'database this app owns and migrates itself. Required — the app has no ' +
       'sessions, users or identities until it is set. A change takes a restart.',
   },
@@ -75,11 +42,11 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     key: 'DB_PORT',
     description: "MySQL port. Empty means MySQL's own default, 3306.",
   },
-  { key: 'DB_USER', description: 'MySQL user for id_db. Required.' },
+  { key: 'DB_USER', description: 'MySQL user for platform_db. Required.' },
   { key: 'DB_PASSWORD', description: 'Password for DB_USER.' },
   {
     key: 'DB_NAME',
-    description: 'Database name, conventionally id_db. Required.',
+    description: 'Database name, conventionally platform_db. Required.',
   },
   {
     key: 'trustedCIDR',
@@ -206,7 +173,7 @@ export class SettingOverriddenError extends Error {
  */
 export class SettingsUnavailableError extends Error {
   constructor(
-    public reason: 'unconfigured' | 'unreachable' | 'base_missing' | 'base_ambiguous' | 'table_missing',
+    public reason: 'unconfigured' | 'unreachable' | 'base_missing' | 'base_ambiguous' | 'table_missing' | 'duplicate',
     message: string
   ) {
     super(message);
@@ -228,9 +195,11 @@ export interface AdminSetting {
 
 interface NocoTableRow {
   Id: number;
-  Key: string;
-  Value: string | null;
-  Description: string | null;
+  app: string;
+  settingKey: string;
+  settingValue: string | null;
+  description: string | null;
+  bSecret?: boolean;
 }
 
 /**
@@ -347,7 +316,9 @@ export class SettingsStore {
         'GET',
         `/api/v2/meta/bases/${baseId}/tables`
       );
-      const table = tables.list.find((t) => t.title === SETTINGS_TABLE_NAME);
+      const matchingTables = tables.list.filter((t) => t.title === SETTINGS_TABLE_NAME);
+      if (matchingTables.length > 1) throw new SettingsUnavailableError('duplicate', 'Duplicate settings tables');
+      const table = matchingTables[0];
       if (!table) {
         throw new SettingsUnavailableError(
           'table_missing',
@@ -413,6 +384,7 @@ export class SettingsStore {
         'GET',
         `/api/v2/meta/bases/${base.id}/tables`
       );
+      if (tables.list.filter(t => t.title === SETTINGS_TABLE_NAME).length > 1) throw new SettingsUnavailableError('duplicate', 'Duplicate settings tables');
       const table =
         tables.list.find((t) => t.title === SETTINGS_TABLE_NAME) ??
         (await this.api<{ id: string; title: string }>(
@@ -423,9 +395,13 @@ export class SettingsStore {
             title: SETTINGS_TABLE_NAME,
             columns: [
               { column_name: 'id', title: 'Id', uidt: 'ID', pk: true },
-              { column_name: 'key', title: 'Key', uidt: 'SingleLineText' },
-              { column_name: 'value', title: 'Value', uidt: 'LongText' },
-              { column_name: 'description', title: 'Description', uidt: 'LongText' },
+              { column_name: 'app', title: 'app', uidt: 'SingleLineText' },
+              { column_name: 'settingKey', title: 'settingKey', uidt: 'SingleLineText' },
+              { column_name: 'settingValue', title: 'settingValue', uidt: 'LongText' },
+              { column_name: 'description', title: 'description', uidt: 'LongText' },
+              { column_name: 'bSecret', title: 'bSecret', uidt: 'Checkbox' },
+              { column_name: 'dtCreated', title: 'dtCreated', uidt: 'CreatedTime' },
+              { column_name: 'dtUpdated', title: 'dtUpdated', uidt: 'LastModifiedTime' },
             ],
           }
         ));
@@ -438,14 +414,14 @@ export class SettingsStore {
       // stale the moment the environment changed. The setup wizard fills
       // these in from the URL the first admin actually reached this app on.
       const rows = await this.listRows();
-      const present = new Set(rows.map((r) => r.Key));
+      const present = new Set(rows.filter(r => r.app === SETTINGS_SCOPE).map((r) => r.settingKey));
       const missing = KNOWN_SETTINGS.filter((s) => !present.has(s.key));
       if (missing.length) {
         // v2 records POST accepts an array for bulk insert.
         await this.api(
           'POST',
           `/api/v2/tables/${table.id}/records`,
-          missing.map((s) => ({ Key: s.key, Value: '', Description: s.description }))
+          missing.map((s) => ({ app: SETTINGS_SCOPE, settingKey: s.key, settingValue: '', description: s.description, bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(s.key) }))
         );
       }
     } catch (err) {
@@ -465,8 +441,14 @@ export class SettingsStore {
           `/api/v2/tables/${tableId}/records?limit=200&offset=${offset}`
         );
         out.push(...page.list);
-        if (page.list.length < 200 || page.pageInfo?.isLastPage !== false) break;
+        if (page.list.length < 200 || page.pageInfo?.isLastPage === true) break;
         offset += 200;
+      }
+      const seen = new Set<string>();
+      for (const row of out) {
+        const key = JSON.stringify([row.app, row.settingKey]);
+        if (seen.has(key)) throw new SettingsUnavailableError('duplicate', `Duplicate setting for scope ${row.app} and key ${row.settingKey}`);
+        seen.add(key);
       }
       return out;
     } catch (err) {
@@ -486,9 +468,9 @@ export class SettingsStore {
     if (this.cache && Date.now() - this.cache.at < CACHE_TTL_MS) return this.cache.settings;
     const rows = await this.listRows();
     const settings: Settings = {};
-    for (const r of rows) {
-      if (r.Key && r.Value != null && String(r.Value).trim() !== '') {
-        settings[r.Key] = String(r.Value).trim();
+    for (const r of [...rows.filter(r => r.app === '*'), ...rows.filter(r => r.app === SETTINGS_SCOPE)]) {
+      if (r.settingKey && r.settingValue != null && String(r.settingValue).trim() !== '') {
+        settings[r.settingKey] = String(r.settingValue).trim();
       }
     }
     Object.assign(settings, this.overrides);
@@ -509,17 +491,18 @@ export class SettingsStore {
   async listForAdmin(): Promise<AdminSetting[]> {
     const rows = await this.listRows();
     const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
-    const items: AdminSetting[] = rows
-      .filter((r) => r.Key)
+    const effective = await this.getAll();
+    const scopedRows = new Map<string, NocoTableRow>();
+    for (const row of [...rows.filter(r=>r.app === '*'), ...rows.filter(r=>r.app === SETTINGS_SCOPE)]) scopedRows.set(row.settingKey,row);
+    const items: AdminSetting[] = [...scopedRows.values()]
+      .filter((r) => r.settingKey && (r.app === SETTINGS_SCOPE || r.app === '*'))
       .map((r) => ({
-        key: r.Key,
-        value: this.isOverridden(r.Key)
-          ? this.overrides[r.Key]
-          : r.Value == null
-            ? ''
-            : String(r.Value),
-        description: r.Description == null ? '' : String(r.Description),
-        source: this.isOverridden(r.Key) ? ('environment' as const) : ('store' as const),
+        key: r.settingKey,
+        value: this.isOverridden(r.settingKey)
+          ? this.overrides[r.settingKey]
+          : effective[r.settingKey] ?? '',
+        description: r.description == null ? '' : String(r.description),
+        source: this.isOverridden(r.settingKey) ? ('environment' as const) : ('store' as const),
       }));
 
     // An override for a key the store has no row for yet (NocoDB seeded
@@ -543,17 +526,19 @@ export class SettingsStore {
     if (this.isOverridden(key)) throw new SettingOverriddenError(key);
     const { tableId } = await this.resolveIds();
     const rows = await this.listRows();
-    const existing = rows.find((r) => r.Key === key);
+    const existing = rows.find((r) => r.app === SETTINGS_SCOPE && r.settingKey === key);
     if (existing) {
       await this.api('PATCH', `/api/v2/tables/${tableId}/records`, [
-        { Id: existing.Id, Value: value },
+        { Id: existing.Id, settingValue: value },
       ]);
     } else {
       const known = KNOWN_SETTINGS.find((s) => s.key === key);
       await this.api('POST', `/api/v2/tables/${tableId}/records`, {
-        Key: key,
-        Value: value,
-        Description: known?.description ?? '',
+        app: SETTINGS_SCOPE,
+        settingKey: key,
+        settingValue: value,
+        description: known?.description ?? '',
+        bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(key),
       });
     }
     this.cache = null; // read-your-writes

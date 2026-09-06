@@ -34,9 +34,9 @@ services:
       DB_PORT: ${DB_PORT:-3306}
       DB_USER: ${DB_USER:-identity}
       DB_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
-      DB_NAME: ${DB_NAME:-id_db}
+      DB_NAME: ${DB_NAME:-platform_db}
 
-      # Optional overrides of auth_tbl_Settings rows. Blank counts as unset,
+      # Optional overrides of cfg_tbl_Setting rows. Blank counts as unset,
       # so leaving these alone keeps the zero-config path: the public base
       # URL is whatever URL the browser reached this service on, and the
       # trusted network comes from the settings table.
@@ -74,7 +74,7 @@ services:
     container_name: identity-db
     environment:
       MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?missing — run scripts/install.sh once to generate it}
-      MYSQL_DATABASE: ${DB_NAME:-id_db}
+      MYSQL_DATABASE: ${DB_NAME:-platform_db}
       MYSQL_USER: ${DB_USER:-identity}
       MYSQL_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
     volumes:

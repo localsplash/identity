@@ -9,8 +9,8 @@ import { z } from 'zod';
  *   NOCODB_API_TOKEN    how to read them
  *
  * Everything else — the MySQL coordinates, the trusted network, the public
- * URL, provider credentials — is a row in the `auth_tbl_Settings` table of
- * the `IdentityBase` base (see settings.ts). The base and table are named by
+ * URL, provider credentials — is a row in the `cfg_tbl_Setting` table of
+ * the `PlatformConfig` base (see settings.ts). The base and table are named by
  * convention, not configured, and the base ID is detected from that name at
  * runtime; a base ID in a config file is exactly the coupling the convention
  * exists to remove.
@@ -41,7 +41,7 @@ const envSchema = z.object({
   //   dual   — either is accepted (rollout/migration window)
   //
   // The network itself is NOT here: `trustedCIDR` is one setting for the
-  // whole platform, read from IdentityBase → auth_tbl_Settings so every
+  // whole platform, read from PlatformConfig → cfg_tbl_Setting so every
   // application spells the same network the same way. The environment may
   // still pin it as IDENTITY_TRUSTED_NETWORK (see ENV_ALIASES).
   //

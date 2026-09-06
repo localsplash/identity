@@ -65,7 +65,7 @@
       <p class="text-sm text-slate-600">
         First, where this service keeps its settings. Everything else it needs
         lives in a NocoDB base called
-        <span class="font-mono text-xs">IdentityBase</span>, which is created
+        <span class="font-mono text-xs">PlatformConfig</span>, which is created
         for you if it does not exist yet.
       </p>
       <div id="bootstrapError" class="hidden px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
@@ -102,7 +102,7 @@
       <p class="text-sm text-slate-600">
         First, where the identity data lives. This is the MySQL database this
         app owns and migrates itself; the coordinates are saved to
-        <span class="font-mono text-xs">auth_tbl_Settings</span> like every
+        <span class="font-mono text-xs">cfg_tbl_Setting</span> like every
         other setting, so nothing has to be edited by hand.
       </p>
       <div id="dbError" class="hidden px-4 py-3 rounded-xl bg-red-50 border border-red-200 text-sm text-red-700"></div>
@@ -170,7 +170,7 @@
         Sign in with the OAuth provider of your organisation. If the account you
         verify with belongs to the domain you claim below, you become the Super
         System Admin and these values are saved to the shared
-        <span class="font-mono text-xs">auth_tbl_Settings</span> settings table.
+        <span class="font-mono text-xs">cfg_tbl_Setting</span> settings table.
       </p>
 
       <div>

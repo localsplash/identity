@@ -162,7 +162,7 @@ export async function getSession(
   if (!sessionId || !/^[0-9a-f]{64}$/.test(sessionId)) return null;
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT sSessionId, iUserId, bSuperAdmin, sProvider, sSubject, dtCreated
-       FROM identity_tbl_Session WHERE sSessionId = ? AND dtRevoked IS NULL`,
+       FROM identity_tbl_Session WHERE sSessionId = ? AND dtRevoked IS NULL AND sAppOrigin IS NULL`,
     [sessionId]
   );
   if (!rows.length) return null;
@@ -453,6 +453,8 @@ export async function listEventsSince(
 
 // ─── Central user directory (CIDR-trusted server API) ────────────────────────
 
+export class DirectoryConflictError extends Error {}
+
 export interface DirectoryUser {
   iUserId: number;
   email: string | null;
@@ -468,8 +470,10 @@ const dirUserSelect = `
     FROM identity_tbl_User u`;
 
 function toDirectoryUser(r: mysql.RowDataPacket): DirectoryUser {
+  const id = Number(r.iUserId);
+  if (!Number.isSafeInteger(id) || id < 1) throw new Error('Directory user ID exceeds the safe JSON integer contract');
   return {
-    iUserId: r.iUserId as number,
+    iUserId: id,
     email: (r.email as string) ?? null,
     displayName: (r.displayName as string) ?? null,
     claimed: Boolean(r.claimed),
@@ -498,55 +502,40 @@ export async function getDirectoryUser(
  */
 export async function ensureDirectoryUser(
   pool: mysql.Pool,
-  params: { email: string; displayName: string | null; idempotencyKey: string | null }
+  params: { email: string; displayName: string | null; idempotencyKey: string | null; actorUserId?: number }
 ): Promise<DirectoryUser> {
   const email = params.email.trim().toLowerCase();
   const conn = await pool.getConnection();
+  const lockName = 'identity_directory_ensure';
   try {
-    if (params.idempotencyKey) {
-      const [keyRows] = await conn.query<mysql.RowDataPacket[]>(
-        `${dirUserSelect} JOIN identity_tbl_DirectoryKey k ON k.iUserId = u.iUserId
-          WHERE k.sIdempotencyKey = ?`,
-        [params.idempotencyKey]
-      );
-      if (keyRows.length) return toDirectoryUser(keyRows[0]);
-    }
-
-    // Advisory lock name is hashed: emails can exceed MySQL's 64-char
-    // lock-name limit, and the lock only needs to collide for equal emails.
-    const lockName = `id_dir_${crypto.createHash('sha256').update(email).digest('hex').slice(0, 40)}`;
-    const [lockRows] = await conn.query<mysql.RowDataPacket[]>(`SELECT GET_LOCK(?, 10) AS l`, [
-      lockName,
-    ]);
-    if (Number(lockRows[0]?.l) !== 1) throw new Error('Directory ensure lock timeout');
+    const [locks] = await conn.query<mysql.RowDataPacket[]>(`SELECT GET_LOCK(?,10) AS locked`,[lockName]);
+    if (Number(locks[0]?.locked) !== 1) throw new Error('Directory ensure lock timeout');
     try {
-      const [existing] = await conn.query<mysql.RowDataPacket[]>(
-        `${dirUserSelect} WHERE u.email = ? ORDER BY u.iUserId ASC LIMIT 1`,
-        [email]
-      );
-      let user: DirectoryUser;
-      if (existing.length) {
-        user = toDirectoryUser(existing[0]);
-      } else {
-        const [ins] = await conn.query<mysql.ResultSetHeader>(
-          `INSERT INTO identity_tbl_User (email, displayName) VALUES (?, ?)`,
-          [email, params.displayName]
-        );
-        user = { iUserId: ins.insertId, email, displayName: params.displayName, claimed: false };
-      }
+      await conn.beginTransaction();
       if (params.idempotencyKey) {
-        await conn.query(
-          `INSERT IGNORE INTO identity_tbl_DirectoryKey (sIdempotencyKey, iUserId) VALUES (?, ?)`,
-          [params.idempotencyKey, user.iUserId]
-        );
+        const [rows] = await conn.query<mysql.RowDataPacket[]>(`${dirUserSelect}
+          JOIN identity_tbl_DirectoryKey k ON k.iUserId = u.iUserId WHERE k.sIdempotencyKey = ?`,[params.idempotencyKey]);
+        if (rows.length) {
+          if (String(rows[0].email).toLowerCase() !== email) throw new DirectoryConflictError('Idempotency key already belongs to a different email');
+          await conn.commit();
+          return toDirectoryUser(rows[0]);
+        }
       }
+      const [existing] = await conn.query<mysql.RowDataPacket[]>(`${dirUserSelect} WHERE u.email = ? ORDER BY u.iUserId LIMIT 2`,[email]);
+      if (existing.length > 1) throw new DirectoryConflictError('Email has multiple users; reconcile explicit identities before assigning access');
+      let user: DirectoryUser;
+      if (existing.length) user = toDirectoryUser(existing[0]);
+      else {
+        const [r] = await conn.query<mysql.ResultSetHeader>(`INSERT INTO identity_tbl_User (email,displayName) VALUES (?,?)`,[email,params.displayName]);
+        user = {iUserId:r.insertId,email,displayName:params.displayName,claimed:false};
+      }
+      if (params.idempotencyKey) await conn.query(`INSERT INTO identity_tbl_DirectoryKey (sIdempotencyKey,iUserId) VALUES (?,?)`,[params.idempotencyKey,user.iUserId]);
+      if (params.actorUserId) await conn.query(`INSERT INTO identity_tbl_Audit (iActorUserId,action,jDetail) VALUES (?,'user.ensured',?)`,[params.actorUserId,JSON.stringify({iUserId:user.iUserId})]);
+      await conn.commit();
       return user;
-    } finally {
-      await conn.query(`SELECT RELEASE_LOCK(?)`, [lockName]);
-    }
-  } finally {
-    conn.release();
-  }
+    } catch(e) { await conn.rollback(); throw e; }
+    finally { await conn.query(`SELECT RELEASE_LOCK(?)`,[lockName]); }
+  } finally { conn.release(); }
 }
 
 /**
@@ -603,6 +592,16 @@ export async function mergeUsers(
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+
+    const [conflicts] = await conn.query<mysql.RowDataPacket[]>(`SELECT f.iTenantId FROM identity_tbl_Membership f
+      JOIN identity_tbl_Membership t ON t.iTenantId = f.iTenantId AND t.iUserId = ?
+      WHERE f.iUserId = ? AND (f.role <> t.role OR f.bEnabled <> t.bEnabled) FOR UPDATE`,[toUserId,fromUserId]);
+    if (conflicts.length) throw new Error('Reconcile conflicting tenant memberships before merging users');
+    await conn.query(`INSERT IGNORE INTO identity_tbl_Membership (iTenantId,iUserId,role,bEnabled)
+      SELECT iTenantId,?,role,bEnabled FROM identity_tbl_Membership WHERE iUserId = ?`,[toUserId,fromUserId]);
+    await conn.query(`DELETE FROM identity_tbl_Membership WHERE iUserId = ?`,[fromUserId]);
+    await conn.query(`UPDATE identity_tbl_LegacyMap SET iUserId = ? WHERE iUserId = ?`,[toUserId,fromUserId]);
+    await conn.query(`UPDATE identity_tbl_DirectoryKey SET iUserId = ? WHERE iUserId = ?`,[toUserId,fromUserId]);
 
     const [moved] = await conn.query<mysql.ResultSetHeader>(
       `UPDATE IGNORE identity_tbl_Identity SET iUserId = ? WHERE iUserId = ?`,
