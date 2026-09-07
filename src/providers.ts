@@ -221,6 +221,15 @@ export function isProviderConfigured(p: ProviderDescriptor, settings: Settings):
   return p.requiredKeys.every((k) => Boolean(settings[k]));
 }
 
+/**
+ * "Unclaimed" = no OAuth provider has working config yet, so nobody can
+ * sign in and nobody is Super System Admin. In that state the first-run
+ * setup wizard is open; the moment one provider is configured it closes.
+ */
+export function isUnclaimed(settings: Settings): boolean {
+  return !PROVIDERS.some((p) => isProviderConfigured(p, settings));
+}
+
 export interface LoginMethod {
   id: string;
   label: string;

@@ -47,16 +47,16 @@ export const EVENT_TYPES = [
   'session.revoked',
   /**
    * Two id users were merged: everything that pointed at `fromUserId` now
-   * belongs to `toUserId`. Apps holding a local mapping (EchoWeb's
-   * auth_tbl_User.iIdUserId) must repoint it, and should end sessions
+   * belongs to `toUserId`. Apps holding a local mapping (their own user
+   * table's id-user column) must repoint it, and should end sessions
    * belonging to the retired id user.
    * data: { fromUserId, toUserId }
    */
   'user.merged',
   /**
    * A login method was attached to or removed from a user. Informational
-   * for most apps; apps that key on a specific identity (EchoWeb binds an
-   * org by UISP clientId) may need to react.
+   * for most apps; apps that key on a specific identity (one binding an
+   * org by UISP clientId, say) may need to react.
    * data: { iUserId, provider, subject }
    */
   'identity.linked',

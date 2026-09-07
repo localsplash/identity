@@ -1,22 +1,23 @@
-import express from 'express';
-import mysql from 'mysql2/promise';
-import path from 'path';
-import pinoHttp from 'pino-http';
-import pino from 'pino';
-import { loadConfig } from './config';
-import { getDb, dbCoordinates, resetDb, DbCoordinates } from './db';
-import { runMigrations } from './migrations';
+import express from "express";
+import mysql from "mysql2/promise";
+import path from "path";
+import pinoHttp from "pino-http";
+import pino from "pino";
+import { loadConfig } from "./config";
+import { getDb, dbCoordinates, resetDb, DbCoordinates } from "./db";
+import { runMigrations } from "./migrations";
 import {
   SettingsStore,
   Settings,
   SettingsUnavailableError,
   SETTINGS_BASE_NAME,
   SETTINGS_TABLE_NAME,
-} from './settings';
+} from "./settings";
 import {
   PROVIDERS,
   getProvider,
   isProviderConfigured,
+  isUnclaimed,
   availableLoginMethods,
   isSuperAdmin,
   isTenantLocked,
@@ -25,7 +26,7 @@ import {
   OAuthState,
   OAuthUserInfo,
   ProviderDescriptor,
-} from './providers';
+} from "./providers";
 import {
   SESSION_COOKIE,
   getCookie,
@@ -51,17 +52,36 @@ import {
   identityBaseUrl,
   isHostUnderDomain,
   IDENTITY_HOST_LABEL,
-} from './web';
-import * as store from './store';
-import { parseCidrList, resolveClientIp, ipInCidrs } from './net';
-import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from './webhooks';
+} from "./web";
+import {
+  LOCAL_CONFIG_PATH,
+  localConfigWritable,
+  restartToApplyConfig,
+  writeLocalConfig,
+} from "./localConfig";
+import * as store from "./store";
+import { createAppSession, safeId } from "./platform";
+import { installPlatformRoutes } from "./platformRoutes";
+import { parseCidrList, resolveClientIp, ipInCidrs } from "./net";
+import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from "./webhooks";
 
-const publicDir = path.join(__dirname, '..', 'public');
+const publicDir = path.join(__dirname, "..", "public");
 
 export function buildApp() {
   const config = loadConfig();
   const settingsStore = new SettingsStore(config);
-  const logger = pino({ level: config.LOG_LEVEL });
+  const logger = pino({
+    level: config.LOG_LEVEL,
+    redact: [
+      "req.headers.authorization",
+      "req.headers.cookie",
+      'req.headers[\"x-id-client-secret\"]',
+      "req.query.code",
+      "req.query.state",
+      'res.headers[\"set-cookie\"]',
+      "res.headers.location",
+    ],
+  });
   // The MySQL coordinates are settings too, so the pool cannot be built
   // until the store has been read — it connects on first use instead.
   // getSettings() rather than the store directly, so an environment-pinned
@@ -69,9 +89,18 @@ export function buildApp() {
   const db = getDb(async () => dbCoordinates(await getSettings()));
   const app = express();
 
-  app.use(express.json({ limit: '256kb' }));
+  app.use(express.json({ limit: "256kb" }));
   app.use(express.urlencoded({ extended: false }));
-  app.use(pinoHttp({ logger }));
+  app.use(
+    pinoHttp({
+      logger,
+      serializers: {
+        req(req) {
+          return { ...req, url: String(req.url ?? "").split("?")[0] };
+        },
+      },
+    }),
+  );
   app.use(express.static(publicDir, { index: false }));
 
   /**
@@ -109,50 +138,60 @@ export function buildApp() {
    * domain there is no honest answer, and the empty string says so.
    */
   function baseUrl(settings: Settings, req: express.Request): string {
-    const configured = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
+    const configured = normalizeBaseUrl(settings.APP_BASE_URL ?? "", {
+      allowHttp: true,
+    });
     if (configured) return configured;
-    const proto = String(req.headers['x-forwarded-proto'] ?? req.protocol ?? 'https').split(',')[0];
-    const host = String(req.headers['x-forwarded-host'] ?? req.headers.host ?? '').split(',')[0];
-    const observed = normalizeBaseUrl(`${proto.trim()}://${host.trim()}`, { allowHttp: true });
+    const proto = String(
+      req.headers["x-forwarded-proto"] ?? req.protocol ?? "https",
+    ).split(",")[0];
+    const host = String(
+      req.headers["x-forwarded-host"] ?? req.headers.host ?? "",
+    ).split(",")[0];
+    const observed = normalizeBaseUrl(`${proto.trim()}://${host.trim()}`, {
+      allowHttp: true,
+    });
     if (observed) return observed;
-    return identityBaseUrl(settings.PARENT_DOMAIN ?? '');
+    return identityBaseUrl(settings.PARENT_DOMAIN ?? "");
   }
 
   /**
-   * Is id_db usable? The coordinates are settings, so "not configured yet"
+   * Is platform_db usable? The coordinates are settings, so "not configured yet"
    * is an ordinary first-run state rather than a crash — and the wizard has
    * to be able to say which of the two stores is missing.
    */
   async function probeDatabase(): Promise<{
-    state: 'ok' | 'unconfigured' | 'unreachable';
+    state: "ok" | "unconfigured" | "unreachable";
     hint?: string;
   }> {
     const settings = await getSettings();
     if (!dbCoordinates(settings)) {
       return {
-        state: 'unconfigured',
+        state: "unconfigured",
         hint:
-          'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
+          "The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME " +
           `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, ` +
           "or set them in this app's environment, then restart.",
       };
     }
     try {
-      await db.query('SELECT 1');
-      return { state: 'ok' };
+      await db.query("SELECT 1");
+      return { state: "ok" };
     } catch (err) {
-      logger.error({ err }, '[db] probe failed');
+      logger.error({ err }, "[db] probe failed");
       return {
-        state: 'unreachable',
+        state: "unreachable",
         hint:
           `MySQL at ${settings.DB_HOST} did not accept the connection. Check the ` +
-          'DB_* settings (host, port, user, password, database) and that this ' +
-          'host may reach it.',
+          "DB_* settings (host, port, user, password, database) and that this " +
+          "host may reach it.",
       };
     }
   }
 
-  async function resolveSession(req: express.Request): Promise<store.SessionRow | null> {
+  async function resolveSession(
+    req: express.Request,
+  ): Promise<store.SessionRow | null> {
     const id = getCookie(req, SESSION_COOKIE);
     if (!id) return null;
     return store.getSession(db, id);
@@ -166,16 +205,17 @@ export function buildApp() {
   // apps sharing an allowed egress IP can call the same endpoints, which is
   // accepted for the first-party POC on a controlled host. IDENTITY_APP_AUTH_MODE
   // keeps the legacy IDENTITY_CLIENT_SECRET check available during rollout.
-  const proxyCidrs = parseCidrList(config.IDENTITY_TRUSTED_PROXY_CIDRS);
-
   // trustedCIDR is one setting for the whole platform, so it is read per
   // request like every other setting — a change reaches every application
   // within one cache interval, with no restart and no per-app spelling of
   // the same network. Parsing is memoised on the string itself, so the
   // hot path costs a comparison rather than a parse.
-  let cidrCache: { raw: string; parsed: ReturnType<typeof parseCidrList> } | null = null;
+  let cidrCache: {
+    raw: string;
+    parsed: ReturnType<typeof parseCidrList>;
+  } | null = null;
   function trustedCidrs(settings: Settings): ReturnType<typeof parseCidrList> {
-    const raw = settings.trustedCIDR ?? '';
+    const raw = settings.trustedCIDR ?? "";
     if (!cidrCache || cidrCache.raw !== raw) {
       cidrCache = { raw, parsed: raw ? parseCidrList(raw) : [] };
     }
@@ -186,26 +226,31 @@ export function buildApp() {
   function peerIsTrusted(req: express.Request, settings: Settings): boolean {
     const cidrs = trustedCidrs(settings);
     if (!cidrs.length) return false;
-    const peer = resolveClientIp(req, proxyCidrs);
+    const peer = resolveClientIp(req);
     return peer !== null && ipInCidrs(peer.ipNum, cidrs);
   }
 
   /** Generic 403; the specifics go to the log, keyed by a correlation id. */
   function denyUntrusted(req: express.Request, res: express.Response): void {
     const correlationId = store.generateId(8);
-    const peer = resolveClientIp(req, proxyCidrs);
+    const peer = resolveClientIp(req);
     logger.warn(
-      { correlationId, peerIp: peer?.ip ?? null, forwarded: peer?.forwarded ?? false, path: req.path },
-      '[trust] rejected server-endpoint call'
+      {
+        correlationId,
+        peerIp: peer?.ip ?? null,
+        forwarded: peer?.forwarded ?? false,
+        path: req.path,
+      },
+      "[trust] rejected server-endpoint call",
     );
-    res.status(403).json({ error: 'Forbidden', correlationId });
+    res.status(403).json({ error: "Forbidden", correlationId });
   }
 
   function presentedSecret(req: express.Request): string {
     return String(
       (req.body as Record<string, string> | undefined)?.client_secret ??
-        req.get('X-Id-Client-Secret') ??
-        ''
+        req.get("X-Id-Client-Secret") ??
+        "",
     );
   }
 
@@ -216,14 +261,16 @@ export function buildApp() {
    */
   async function requireTrustedApp(
     req: express.Request,
-    res: express.Response
+    res: express.Response,
   ): Promise<Settings | null> {
     const settings = await getSettings();
     const mode = config.IDENTITY_APP_AUTH_MODE;
-    if (mode !== 'secret' && peerIsTrusted(req, settings)) return settings;
-    if (mode !== 'cidr') {
-      if (mode === 'secret' && !settings.IDENTITY_CLIENT_SECRET) {
-        res.status(503).json({ error: 'IDENTITY_CLIENT_SECRET is not configured' });
+    if (mode !== "secret" && peerIsTrusted(req, settings)) return settings;
+    if (mode !== "cidr") {
+      if (mode === "secret" && !settings.IDENTITY_CLIENT_SECRET) {
+        res
+          .status(503)
+          .json({ error: "IDENTITY_CLIENT_SECRET is not configured" });
         return null;
       }
       if (
@@ -243,7 +290,7 @@ export function buildApp() {
    */
   async function requireTrustedPeer(
     req: express.Request,
-    res: express.Response
+    res: express.Response,
   ): Promise<boolean> {
     if (peerIsTrusted(req, await getSettings())) return true;
     denyUntrusted(req, res);
@@ -269,7 +316,7 @@ export function buildApp() {
       provider: string;
       subject: string;
       superAdmin: boolean;
-    }
+    },
   ): Promise<string> {
     await store.touchLastLogin(db, params.iUserId);
     const sessionId = await store.createSession(
@@ -277,7 +324,7 @@ export function buildApp() {
       params.iUserId,
       params.superAdmin,
       params.provider,
-      params.subject
+      params.subject,
     );
     setSessionCookie(res, settings, sessionId);
 
@@ -285,7 +332,11 @@ export function buildApp() {
     clearAuthRequestCookie(res);
 
     if (authreq) {
-      const redirectUri = validateRedirectUri(authreq.redirect_uri, settings, config.NODE_ENV);
+      const redirectUri = validateRedirectUri(
+        authreq.redirect_uri,
+        settings,
+        config.NODE_ENV,
+      );
       if (redirectUri) {
         const code = await store.createAuthCode(db, {
           iUserId: params.iUserId,
@@ -295,14 +346,18 @@ export function buildApp() {
           bSuperAdmin: params.superAdmin,
         });
         const url = new URL(redirectUri);
-        url.searchParams.set('code', code);
-        if (authreq.state) url.searchParams.set('state', authreq.state);
+        url.searchParams.set("code", code);
+        if (authreq.state) url.searchParams.set("state", authreq.state);
         return url.toString();
       }
     }
 
     const fallback = settings.DEFAULT_REDIRECT_URI
-      ? validateRedirectUri(settings.DEFAULT_REDIRECT_URI, settings, config.NODE_ENV)
+      ? validateRedirectUri(
+          settings.DEFAULT_REDIRECT_URI,
+          settings,
+          config.NODE_ENV,
+        )
       : null;
     if (fallback) {
       const code = await store.createAuthCode(db, {
@@ -313,12 +368,12 @@ export function buildApp() {
         bSuperAdmin: params.superAdmin,
       });
       const url = new URL(fallback);
-      url.searchParams.set('code', code);
-      url.searchParams.set('state', 'sso');
+      url.searchParams.set("code", code);
+      url.searchParams.set("state", "sso");
       return url.toString();
     }
 
-    return '/account';
+    return "/account";
   }
 
   /**
@@ -331,35 +386,41 @@ export function buildApp() {
   async function upsertUserForIdentity(
     providerId: string,
     trustEmail: boolean,
-    userInfo: OAuthUserInfo
+    userInfo: OAuthUserInfo,
   ): Promise<number> {
     let iUserId = await store.findUserByIdentity(db, providerId, userInfo.sub);
     if (!iUserId && trustEmail && userInfo.email) {
       iUserId = await store.findUserByEmail(db, userInfo.email);
     }
     if (!iUserId) {
-      iUserId = await store.createUser(db, userInfo.email || null, userInfo.name || null);
+      iUserId = await store.createUser(
+        db,
+        userInfo.email || null,
+        userInfo.name || null,
+      );
     }
-    await store.ensureIdentity(db, iUserId, providerId, userInfo.sub, userInfo.email || null);
+    await store.ensureIdentity(
+      db,
+      iUserId,
+      providerId,
+      userInfo.sub,
+      userInfo.email || null,
+    );
+    if (trustEmail && userInfo.email)
+      await db.query(
+        `UPDATE identity_tbl_User SET email=COALESCE(email,?) WHERE iUserId=?`,
+        [userInfo.email.trim().toLowerCase(), iUserId],
+      );
     return iUserId;
-  }
-
-  /**
-   * "Unclaimed" = no OAuth provider has working config yet, so nobody can
-   * sign in and nobody is Super System Admin. In that state the first-run
-   * setup wizard is open; the moment one provider is configured it closes.
-   */
-  function isUnclaimed(settings: Settings): boolean {
-    return !PROVIDERS.some((p) => isProviderConfigured(p, settings));
   }
 
   // ── Basic pages ────────────────────────────────────────────────────────────
 
-  app.get('/healthz', (_req, res) => {
+  app.get("/healthz", (_req, res) => {
     // Deliberately settings-free: it answers while the store is down, which
     // is what makes it useful for telling "the process is up" apart from
     // "the process cannot read its configuration".
-    res.json({ ok: true, service: 'identity' });
+    res.json({ ok: true, service: "identity" });
   });
 
   /**
@@ -368,60 +429,92 @@ export function buildApp() {
    * IDs, so a base that was missing (or renamed) a moment ago is re-detected
    * rather than remembered as missing.
    */
-  app.get('/api/settings/health', async (_req, res) => {
+  app.get("/api/settings/health", async (_req, res) => {
     settingsStore.invalidate();
     try {
       await settingsStore.ping();
-      return res.json({ ok: true, base: SETTINGS_BASE_NAME, table: SETTINGS_TABLE_NAME });
+      return res.json({
+        ok: true,
+        base: SETTINGS_BASE_NAME,
+        table: SETTINGS_TABLE_NAME,
+      });
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
       return res.status(503).json({
         ok: false,
         error: message,
-        reason: err instanceof SettingsUnavailableError ? err.reason : 'unreachable',
+        reason:
+          err instanceof SettingsUnavailableError ? err.reason : "unreachable",
         base: SETTINGS_BASE_NAME,
         nocodbUrl: config.NOCODB_BASE_URL,
       });
     }
   });
 
-  app.get('/', async (req, res) => {
+  app.get("/", async (req, res) => {
+    // Before the store is named, the front door is the wizard. Asking the
+    // store first would answer the very first visit to a fresh install with
+    // the "settings unavailable" page — technically true, and useless: the
+    // page they need is the one that fixes it.
+    if (!settingsStore.isConfigured()) return res.redirect("/setup");
     const session = await resolveSession(req);
-    if (session) return res.redirect('/account');
+    if (session) return res.redirect("/account");
     const settings = await getSettings();
-    if (isUnclaimed(settings)) return res.redirect('/setup');
-    return res.sendFile(path.join(publicDir, 'login.html'));
+    if (isUnclaimed(settings)) return res.redirect("/setup");
+    return res.sendFile(path.join(publicDir, "login.html"));
   });
 
-  app.get('/account', async (req, res) => {
+  app.get("/account", async (req, res) => {
     const session = await resolveSession(req);
-    if (!session) return res.redirect('/');
-    return res.sendFile(path.join(publicDir, 'account.html'));
+    if (!session) return res.redirect("/");
+    return res.sendFile(path.join(publicDir, "account.html"));
   });
 
-  app.get('/admin', async (req, res) => {
+  app.get("/admin", async (req, res) => {
     const session = await resolveSession(req);
-    if (!session?.bSuperAdmin) return res.redirect('/');
-    return res.sendFile(path.join(publicDir, 'admin.html'));
+    if (!session?.bSuperAdmin) return res.redirect("/");
+    return res.sendFile(path.join(publicDir, "admin.html"));
   });
 
   // Which login methods are currently usable. A method whose settings are
   // missing is absent — the login page renders only what can actually work.
-  app.get('/api/providers', async (_req, res) => {
+  app.get("/api/providers", async (_req, res) => {
     const settings = await getSettings();
-    res.json({ items: availableLoginMethods(settings), unclaimed: isUnclaimed(settings) });
+    res.json({
+      items: availableLoginMethods(settings),
+      unclaimed: isUnclaimed(settings),
+    });
   });
 
   // ── First-run setup wizard ─────────────────────────────────────────────────
 
-  app.get('/setup', async (_req, res) => {
+  app.get("/setup", async (_req, res) => {
+    // Before the store is named there is nothing to ask it, and this page is
+    // the only thing that can name it — so it renders without consulting it.
+    if (!settingsStore.isConfigured()) {
+      return res.sendFile(path.join(publicDir, "setup.html"));
+    }
     const settings = await getSettings();
-    if (!isUnclaimed(settings)) return res.redirect('/');
-    return res.sendFile(path.join(publicDir, 'setup.html'));
+    if (!isUnclaimed(settings)) return res.redirect("/");
+    return res.sendFile(path.join(publicDir, "setup.html"));
   });
 
-  app.get('/api/setup/status', async (req, res) => {
+  app.get("/api/setup/status", async (req, res) => {
     settingsStore.invalidate();
+
+    // Step 1: the store has no address yet. Nothing below can run — every
+    // one of those questions is answered out of the store — so report the
+    // one thing that is true and let the wizard ask for it.
+    if (!settingsStore.isConfigured()) {
+      return res.json({
+        unclaimed: true,
+        step: "bootstrap",
+        configPath: LOCAL_CONFIG_PATH,
+        configWritable: localConfigWritable(),
+        identityHostLabel: IDENTITY_HOST_LABEL,
+      });
+    }
+
     const settings = await getSettings();
 
     // Once claimed there is no wizard, and the diagnostics below name
@@ -444,10 +537,10 @@ export function buildApp() {
     const pending = inFlight
       ? {
           parentDomain: inFlight.parentDomain,
-          adminDomain: inFlight.adminDomain ?? '',
+          adminDomain: inFlight.adminDomain ?? "",
           provider: inFlight.provider,
           clientId: inFlight.clientId,
-          tenant: inFlight.tenant ?? '',
+          tenant: inFlight.tenant ?? "",
         }
       : null;
 
@@ -459,21 +552,149 @@ export function buildApp() {
     // let anyone contradict) or a row already in the store.
     return res.json({
       unclaimed: isUnclaimed(settings),
+      step: "claim",
       database: database.state,
       databaseHint: database.hint,
       pending,
       pinned: {
-        appBaseUrl: normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true }) ?? '',
-        parentDomain: settings.PARENT_DOMAIN ?? '',
+        appBaseUrl:
+          normalizeBaseUrl(settings.APP_BASE_URL ?? "", { allowHttp: true }) ??
+          "",
+        parentDomain: settings.PARENT_DOMAIN ?? "",
+        trustedCIDR: settings.trustedCIDR ?? "",
       },
       locked: {
-        appBaseUrl: settingsStore.isOverridden('APP_BASE_URL'),
-        parentDomain: settingsStore.isOverridden('PARENT_DOMAIN'),
+        appBaseUrl: settingsStore.isOverridden("APP_BASE_URL"),
+        parentDomain: settingsStore.isOverridden("PARENT_DOMAIN"),
+        trustedCIDR: settingsStore.isOverridden("trustedCIDR"),
       },
+      // The claim cannot complete while this is empty. Step 1 asks for it,
+      // but an instance whose NocoDB address came from the environment never
+      // saw step 1 — so the claim has to ask, or nothing ever would.
+      needsTrustedCIDR:
+        !settings.trustedCIDR && !settingsStore.isOverridden("trustedCIDR"),
       // The convention the wizard shows when it has to name an expected
       // shape ("identity.example.com") — the one default in this codebase.
       identityHostLabel: IDENTITY_HOST_LABEL,
     });
+  });
+
+  /**
+   * Step 1 of the wizard: where the settings store is, and which network is
+   * trusted.
+   *
+   * This is the only endpoint that runs before the app knows anything about
+   * itself, so it does its own validating rather than leaning on state that
+   * does not exist yet. Nothing is written until all of it holds:
+   *
+   *   - trustedCIDR parses, and is not empty. It is required here on
+   *     purpose. It is the one security decision that cannot be deferred to
+   *     a later screen, because the endpoints it guards exist the moment
+   *     this process listens, and a deployment that never comes back to set
+   *     it is a deployment that never notices it is open.
+   *   - The NocoDB address and token actually work: the base is found or
+   *     created and the settings table with it. A typo is a message on this
+   *     screen, not a restart loop the operator has to read logs to explain.
+   *
+   * trustedCIDR then goes to the store, not to the local file. It is ONE
+   * value for the whole platform — every application reads the same row —
+   * and a copy pinned inside this container would be a second answer that
+   * silently outranks it. The local file keeps only what the store cannot
+   * hold: the store's own address.
+   */
+  app.post("/api/setup/bootstrap", async (req, res, next) => {
+    try {
+      if (settingsStore.isConfigured()) {
+        return res
+          .status(409)
+          .json({
+            error: "This instance already knows where its settings live.",
+          });
+      }
+      if (!localConfigWritable()) {
+        return res.status(503).json({
+          error:
+            `${LOCAL_CONFIG_PATH} is not writable, so this cannot be saved. Mount a ` +
+            "writable volume there, or set NOCODB_BASE_URL and NOCODB_API_TOKEN in " +
+            "this app's environment instead.",
+        });
+      }
+
+      const body = (req.body ?? {}) as Record<string, string>;
+      const token = String(body.nocodbApiToken ?? "").trim();
+      const trustedCIDR = String(body.trustedCIDR ?? "").trim();
+      const baseUrlRaw = String(body.nocodbBaseUrl ?? "").trim();
+      const nocodbBaseUrl = normalizeBaseUrl(baseUrlRaw, { allowHttp: true });
+
+      if (!nocodbBaseUrl) {
+        return res
+          .status(400)
+          .json({
+            error: "Enter the NocoDB URL, e.g. https://nocodb.example.com.",
+          });
+      }
+      if (!token) {
+        return res
+          .status(400)
+          .json({ error: "Enter a NocoDB API token (Account → Tokens)." });
+      }
+      if (!trustedCIDR) {
+        return res.status(400).json({
+          error:
+            "Enter the trusted network. It is what admits your application servers " +
+            "to the server-only endpoints, and there is no safe default for it.",
+        });
+      }
+      try {
+        if (parseCidrList(trustedCIDR).length === 0) throw new Error("empty");
+      } catch (err) {
+        return res.status(400).json({
+          error:
+            `${String((err as Error).message).replace(/^Error: /, "")} — give one or more ` +
+            "IPv4 CIDRs, e.g. 10.9.0.0/16 or 203.0.113.7.",
+        });
+      }
+
+      // Prove the address before saving it. A store built on the candidate
+      // values, with no environment overrides, so this tests exactly what
+      // the next boot will use.
+      const candidate = new SettingsStore(
+        { ...config, NOCODB_BASE_URL: nocodbBaseUrl, NOCODB_API_TOKEN: token },
+        {},
+      );
+      try {
+        await candidate.bootstrap();
+      } catch (err) {
+        const reason =
+          err instanceof SettingsUnavailableError ? err.reason : "unreachable";
+        return res.status(400).json({
+          error: err instanceof Error ? err.message : String(err),
+          reason,
+        });
+      }
+
+      // The platform-wide row, written where every application reads it.
+      await candidate.set("trustedCIDR", trustedCIDR);
+
+      writeLocalConfig({
+        NOCODB_BASE_URL: nocodbBaseUrl,
+        NOCODB_API_TOKEN: token,
+      });
+      logger.info(
+        { store: nocodbBaseUrl, configPath: LOCAL_CONFIG_PATH },
+        "[setup] settings store recorded; restarting to read it",
+      );
+
+      // The process read its configuration once, at boot. Rather than teach
+      // every holder of it to change its mind, exit and let the container
+      // come back — restart: unless-stopped makes that the shortest path to
+      // a process that is simply configured from the start.
+      res.json({ ok: true, restarting: true, configPath: LOCAL_CONFIG_PATH });
+      res.on("finish", () => restartToApplyConfig());
+      return undefined;
+    } catch (err) {
+      return next(err);
+    }
   });
 
   /**
@@ -484,30 +705,38 @@ export function buildApp() {
    * real connection, then written to the settings table. Nobody should have
    * to hand-edit a row in NocoDB to get an instance to start.
    */
-  app.post('/api/setup/database', async (req, res, next) => {
+  app.post("/api/setup/database", async (req, res, next) => {
     try {
       settingsStore.invalidate();
       if (!isUnclaimed(await getSettings())) {
-        return res.status(409).json({ error: 'This instance is already set up.' });
+        return res
+          .status(409)
+          .json({ error: "This instance is already set up." });
       }
 
       const body = (req.body ?? {}) as Record<string, string>;
       const coords: DbCoordinates | null = dbCoordinates({
-        DB_HOST: String(body.host ?? ''),
-        DB_PORT: String(body.port ?? ''),
-        DB_USER: String(body.user ?? ''),
-        DB_PASSWORD: String(body.password ?? ''),
-        DB_NAME: String(body.database ?? ''),
+        DB_HOST: String(body.host ?? ""),
+        DB_PORT: String(body.port ?? ""),
+        DB_USER: String(body.user ?? ""),
+        DB_PASSWORD: String(body.password ?? ""),
+        DB_NAME: String(body.database ?? ""),
       });
       if (!coords) {
-        return res.status(400).json({ error: 'Host, user and database name are required.' });
+        return res
+          .status(400)
+          .json({ error: "Host, user and database name are required." });
       }
 
       // Prove the coordinates before writing them: a settings table holding
       // a database nobody can reach is worse than an empty one.
-      const probe = mysql.createPool({ ...coords, connectionLimit: 1, timezone: 'Z' });
+      const probe = mysql.createPool({
+        ...coords,
+        connectionLimit: 1,
+        timezone: "Z",
+      });
       try {
-        await probe.query('SELECT 1');
+        await probe.query("SELECT 1");
       } catch (err) {
         return res.status(400).json({
           error:
@@ -535,7 +764,7 @@ export function buildApp() {
       const applied = await runMigrations(db);
       logger.warn(
         `[setup] identity database set to ${coords.host}:${coords.port}/${coords.database}` +
-          (applied.length ? ` (applied ${applied.join(', ')})` : '')
+          (applied.length ? ` (applied ${applied.join(", ")})` : ""),
       );
       return res.json({ ok: true, migrations: applied });
     } catch (err) {
@@ -558,14 +787,19 @@ export function buildApp() {
     settings: Settings,
     req: express.Request,
     submitted: string,
-    parentDomain: string
+    parentDomain: string,
   ): { url: string } | { error: string } {
-    const production = config.NODE_ENV === 'production';
-    if (settingsStore.isOverridden('APP_BASE_URL')) {
-      const pinned = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
+    const production = config.NODE_ENV === "production";
+    if (settingsStore.isOverridden("APP_BASE_URL")) {
+      const pinned = normalizeBaseUrl(settings.APP_BASE_URL ?? "", {
+        allowHttp: true,
+      });
       return pinned
         ? { url: pinned }
-        : { error: "APP_BASE_URL is set in this app's environment but is not a valid URL." };
+        : {
+            error:
+              "APP_BASE_URL is set in this app's environment but is not a valid URL.",
+          };
     }
 
     const raw = submitted.trim();
@@ -575,7 +809,7 @@ export function buildApp() {
     if (!url) {
       return {
         error: production
-          ? 'The service URL must be an https:// URL, e.g. ' +
+          ? "The service URL must be an https:// URL, e.g. " +
             `https://${IDENTITY_HOST_LABEL}.${parentDomain}.`
           : `Enter a valid service URL, e.g. https://${IDENTITY_HOST_LABEL}.${parentDomain}.`,
       };
@@ -600,70 +834,131 @@ export function buildApp() {
    * callback, and only if the round trip works AND the signed-in address is
    * provably on the claimed domain.
    */
-  app.post('/api/setup/start', async (req, res, next) => {
+  app.post("/api/setup/start", async (req, res, next) => {
     try {
       settingsStore.invalidate();
       const settings = await getSettings();
       if (!isUnclaimed(settings)) {
-        return res.status(409).json({ error: 'This instance is already set up.' });
+        return res
+          .status(409)
+          .json({ error: "This instance is already set up." });
       }
       const database = await probeDatabase();
-      if (database.state !== 'ok') {
+      if (database.state !== "ok") {
         return res.status(503).json({ error: database.hint });
       }
 
       const body = (req.body ?? {}) as Record<string, string>;
-      const parentDomain = String(body.parentDomain ?? '').trim().toLowerCase();
-      const adminDomain = String(body.adminDomain ?? '').trim().toLowerCase();
-      const providerId = String(body.provider ?? '');
-      const clientId = String(body.clientId ?? '').trim();
-      const tenant = String(body.tenant ?? '').trim();
+      const parentDomain = String(body.parentDomain ?? "")
+        .trim()
+        .toLowerCase();
+      const adminDomain = String(body.adminDomain ?? "")
+        .trim()
+        .toLowerCase();
+      const providerId = String(body.provider ?? "");
+      const clientId = String(body.clientId ?? "").trim();
+      const tenant = String(body.tenant ?? "").trim();
+
+      /**
+       * No instance becomes claimed without a trusted network.
+       *
+       * This is the same requirement step 1 makes, enforced again here
+       * because step 1 is skipped whenever the NocoDB address came from the
+       * environment. Without it, such an instance could be claimed with the
+       * network policy empty — and the boot check that is supposed to catch
+       * exactly that only refuses once the instance is already claimed,
+       * which is one restart too late to be any help.
+       *
+       * Only asked while it is missing: a value already in the store, or
+       * pinned in the environment, is left alone rather than offered up for
+       * an unauthenticated visitor to overwrite.
+       */
+      const settingsTrustedCIDR = String(settings.trustedCIDR ?? "").trim();
+      const needsTrustedCIDR =
+        !settingsTrustedCIDR && !settingsStore.isOverridden("trustedCIDR");
+      const trustedCIDR = needsTrustedCIDR
+        ? String(body.trustedCIDR ?? "").trim() ||
+          (inFlightTrustedCIDR(req) ?? "")
+        : "";
+      if (needsTrustedCIDR) {
+        if (!trustedCIDR) {
+          return res.status(400).json({
+            error:
+              "Enter the trusted network. Until it names a network, every " +
+              "server-only endpoint refuses every caller, and no application " +
+              "can obtain a token.",
+          });
+        }
+        try {
+          if (parseCidrList(trustedCIDR).length === 0) throw new Error("empty");
+        } catch (err) {
+          return res.status(400).json({
+            error:
+              `${String((err as Error).message).replace(/^Error: /, "")} — give one or ` +
+              "more IPv4 CIDRs, e.g. 10.9.0.0/16 or 203.0.113.7.",
+          });
+        }
+      }
 
       // Retrying with a corrected admin domain must not make the admin dig
       // the client secret out again: reuse the one from the pending claim
       // when the body omits it and the rest of the credentials match.
       const inFlight = getSetupFromCookie(req);
       const clientSecret =
-        String(body.clientSecret ?? '').trim() ||
-        (inFlight && inFlight.provider === providerId && inFlight.clientId === clientId
+        String(body.clientSecret ?? "").trim() ||
+        (inFlight &&
+        inFlight.provider === providerId &&
+        inFlight.clientId === clientId
           ? inFlight.clientSecret
-          : '');
+          : "");
 
       if (!isValidDomain(parentDomain)) {
-        return res.status(400).json({ error: 'Enter a valid parent domain, e.g. example.com.' });
+        return res
+          .status(400)
+          .json({ error: "Enter a valid parent domain, e.g. example.com." });
       }
       if (adminDomain && !isValidDomainList(adminDomain)) {
         return res.status(400).json({
-          error: 'Super Admin domain must be a domain, or a comma-separated list of domains.',
+          error:
+            "Super Admin domain must be a domain, or a comma-separated list of domains.",
         });
       }
       // The wizard is limited to providers that can prove the claimer's domain.
-      if (providerId !== 'google' && providerId !== 'microsoft') {
-        return res.status(400).json({ error: 'Setup supports Google or Microsoft only.' });
+      if (providerId !== "google" && providerId !== "microsoft") {
+        return res
+          .status(400)
+          .json({ error: "Setup supports Google or Microsoft only." });
       }
       if (!clientId || !clientSecret) {
-        return res.status(400).json({ error: 'Client ID and client secret are required.' });
+        return res
+          .status(400)
+          .json({ error: "Client ID and client secret are required." });
       }
-      if (providerId === 'microsoft' && !isTenantLocked({ MICROSOFT_TENANT: tenant })) {
+      if (
+        providerId === "microsoft" &&
+        !isTenantLocked({ MICROSOFT_TENANT: tenant })
+      ) {
         return res.status(400).json({
           error:
             "Microsoft setup needs your directory (tenant) ID — with 'common' any tenant " +
-            'could assert an address on your domain, so it cannot prove the claim.',
+            "could assert an address on your domain, so it cannot prove the claim.",
         });
       }
 
       const resolvedBase = resolveSetupBaseUrl(
         settings,
         req,
-        String(body.appBaseUrl ?? ''),
-        parentDomain
+        String(body.appBaseUrl ?? ""),
+        parentDomain,
       );
-      if ('error' in resolvedBase) return res.status(400).json({ error: resolvedBase.error });
+      if ("error" in resolvedBase)
+        return res.status(400).json({ error: resolvedBase.error });
 
       const setup: SetupRequest = {
         csrf: store.generateId(16),
         parentDomain,
         adminDomain: adminDomain || undefined,
+        trustedCIDR: trustedCIDR || undefined,
         appBaseUrl: resolvedBase.url,
         provider: providerId,
         clientId,
@@ -672,7 +967,11 @@ export function buildApp() {
       };
       setSetupCookie(res, setup);
 
-      const state: OAuthState = { csrf: setup.csrf, context: 'setup', provider: providerId };
+      const state: OAuthState = {
+        csrf: setup.csrf,
+        context: "setup",
+        provider: providerId,
+      };
       setOAuthStateCookie(res, state);
 
       const provider = getProvider(providerId)!;
@@ -681,7 +980,7 @@ export function buildApp() {
         authUrl: provider.buildAuthUrl(
           candidate,
           setup.appBaseUrl,
-          Buffer.from(JSON.stringify(state)).toString('base64url')
+          Buffer.from(JSON.stringify(state)).toString("base64url"),
         ),
       });
     } catch (err) {
@@ -690,6 +989,11 @@ export function buildApp() {
   });
 
   /** The settings the wizard is proposing, before anything is saved. */
+  /** The trusted network from a claim already in flight, if there is one. */
+  function inFlightTrustedCIDR(req: express.Request): string | undefined {
+    return getSetupFromCookie(req)?.trustedCIDR;
+  }
+
   function candidateSettings(setup: SetupRequest): Settings {
     const candidate: Settings = {
       PARENT_DOMAIN: setup.parentDomain,
@@ -697,10 +1001,11 @@ export function buildApp() {
     };
     // Only when it differs; otherwise the PARENT_DOMAIN default applies and
     // no redundant row is written.
+    if (setup.trustedCIDR) candidate.trustedCIDR = setup.trustedCIDR;
     if (setup.adminDomain && setup.adminDomain !== setup.parentDomain) {
       candidate.SUPERADMIN_DOMAIN = setup.adminDomain;
     }
-    if (setup.provider === 'google') {
+    if (setup.provider === "google") {
       candidate.GOOGLE_CLIENT_ID = setup.clientId;
       candidate.GOOGLE_CLIENT_SECRET = setup.clientSecret;
     } else {
@@ -708,7 +1013,7 @@ export function buildApp() {
       candidate.MICROSOFT_CLIENT_SECRET = setup.clientSecret;
       // Required by the validation above — the wizard only accepts a
       // tenant-locked Microsoft app, since 'common' cannot prove a domain.
-      candidate.MICROSOFT_TENANT = setup.tenant ?? '';
+      candidate.MICROSOFT_TENANT = setup.tenant ?? "";
     }
     return candidate;
   }
@@ -723,7 +1028,7 @@ export function buildApp() {
     req: express.Request,
     res: express.Response,
     provider: ProviderDescriptor,
-    stored: OAuthState
+    stored: OAuthState,
   ): Promise<string> {
     // The cookie is cleared on every terminal path below, but deliberately
     // survives a domain mismatch — that is a recoverable step in the wizard,
@@ -735,22 +1040,31 @@ export function buildApp() {
 
     settingsStore.invalidate();
     const current = await getSettings();
-    if (!isUnclaimed(current)) return fail('/?auth_error=already_claimed');
+    if (!isUnclaimed(current)) return fail("/?auth_error=already_claimed");
 
     const setup = getSetupFromCookie(req);
-    if (!setup || setup.csrf !== stored.csrf || setup.provider !== provider.id) {
-      return fail('/setup?error=state');
+    if (
+      !setup ||
+      setup.csrf !== stored.csrf ||
+      setup.provider !== provider.id
+    ) {
+      return fail("/setup?error=state");
     }
 
-    const returned = decodeState(String(req.query.state ?? ''));
-    if (!returned || returned.csrf !== stored.csrf) return fail('/setup?error=state');
-    if (req.query.error) return fail('/setup?error=denied');
-    const code = String(req.query.code ?? '');
-    if (!code) return fail('/setup?error=denied');
+    const returned = decodeState(String(req.query.state ?? ""));
+    if (!returned || returned.csrf !== stored.csrf)
+      return fail("/setup?error=state");
+    if (req.query.error) return fail("/setup?error=denied");
+    const code = String(req.query.code ?? "");
+    if (!code) return fail("/setup?error=denied");
 
     const candidate = candidateSettings(setup);
-    const userInfo = await provider.fetchUserInfo(candidate, setup.appBaseUrl, code);
-    if (!userInfo?.sub) return fail('/setup?error=verify_failed');
+    const userInfo = await provider.fetchUserInfo(
+      candidate,
+      setup.appBaseUrl,
+      code,
+    );
+    if (!userInfo?.sub) return fail("/setup?error=verify_failed");
 
     if (!isSuperAdmin(provider, userInfo, candidate)) {
       // The credentials work; the account simply is not on a domain this
@@ -782,14 +1096,14 @@ export function buildApp() {
       await settingsStore.set(key, value);
     }
     if (!current.IDENTITY_CLIENT_SECRET) {
-      await settingsStore.set('IDENTITY_CLIENT_SECRET', store.generateId(32));
+      await settingsStore.set("IDENTITY_CLIENT_SECRET", store.generateId(32));
     }
     settingsStore.invalidate();
 
     const iUserId = await upsertUserForIdentity(provider.id, true, userInfo);
     logger.warn(
       `[setup] instance claimed for ${setup.parentDomain} by ${userInfo.email} via ${provider.id}` +
-        ` (Super Admin domain: ${superAdminDomains(candidate).join(', ')})`
+        ` (Super Admin domain: ${superAdminDomains(candidate).join(", ")})`,
     );
 
     const dest = await finishLogin(req, res, await getSettings(), {
@@ -799,7 +1113,7 @@ export function buildApp() {
       superAdmin: true,
     });
     // A pending app request still wins; otherwise land on the admin console.
-    return dest === '/account' ? '/admin?setup=complete' : dest;
+    return dest === "/account" ? "/admin?setup=complete" : dest;
   }
 
   // ── Application entry: /authorize ──────────────────────────────────────────
@@ -812,19 +1126,19 @@ export function buildApp() {
    * straight back. Otherwise the request is parked in a cookie and the login
    * page takes over; finishLogin() completes the round trip.
    */
-  app.get('/authorize', async (req, res, next) => {
+  app.get("/authorize", async (req, res, next) => {
     try {
       const settings = await getSettings();
       const redirectUri = validateRedirectUri(
-        String(req.query.redirect_uri ?? ''),
+        String(req.query.redirect_uri ?? ""),
         settings,
-        config.NODE_ENV
+        config.NODE_ENV,
       );
       if (!redirectUri) {
         return res
           .status(400)
           .send(
-            'Invalid redirect_uri: must be an https URL under the configured parent domain.'
+            "Invalid redirect_uri: must be an https URL under the configured parent domain.",
           );
       }
       const state = req.query.state ? String(req.query.state) : undefined;
@@ -839,13 +1153,13 @@ export function buildApp() {
           bSuperAdmin: session.bSuperAdmin,
         });
         const url = new URL(redirectUri);
-        url.searchParams.set('code', code);
-        if (state) url.searchParams.set('state', state);
+        url.searchParams.set("code", code);
+        if (state) url.searchParams.set("state", state);
         return res.redirect(url.toString());
       }
 
       setAuthRequestCookie(res, { redirect_uri: redirectUri, state });
-      return res.sendFile(path.join(publicDir, 'login.html'));
+      return res.sendFile(path.join(publicDir, "login.html"));
     } catch (err) {
       next(err);
     }
@@ -853,21 +1167,25 @@ export function buildApp() {
 
   // ── OAuth providers (generic routes over the registry) ─────────────────────
 
-  app.get('/auth/:provider', async (req, res, next) => {
+  app.get("/auth/:provider", async (req, res, next) => {
     try {
       const settings = await getSettings();
       const provider = getProvider(req.params.provider);
       if (!provider || !isProviderConfigured(provider, settings)) {
-        return res.redirect('/?auth_error=provider_not_configured');
+        return res.redirect("/?auth_error=provider_not_configured");
       }
       const state: OAuthState = {
         csrf: store.generateId(16),
-        context: 'login',
+        context: "login",
         provider: provider.id,
       };
       setOAuthStateCookie(res, state);
       return res.redirect(
-        provider.buildAuthUrl(settings, baseUrl(settings, req), Buffer.from(JSON.stringify(state)).toString('base64url'))
+        provider.buildAuthUrl(
+          settings,
+          baseUrl(settings, req),
+          Buffer.from(JSON.stringify(state)).toString("base64url"),
+        ),
       );
     } catch (err) {
       next(err);
@@ -876,84 +1194,105 @@ export function buildApp() {
 
   // Link an additional identity to the already-signed-in user. The target
   // user comes from the server-side session, never from the request.
-  app.get('/auth/:provider/link', async (req, res, next) => {
+  app.get("/auth/:provider/link", async (req, res, next) => {
     try {
       const settings = await getSettings();
       const provider = getProvider(req.params.provider);
       if (!provider || !isProviderConfigured(provider, settings)) {
-        return res.redirect('/?auth_error=provider_not_configured');
+        return res.redirect("/?auth_error=provider_not_configured");
       }
       const session = await resolveSession(req);
-      if (!session) return res.redirect('/');
+      if (!session) return res.redirect("/");
 
       const state: OAuthState = {
         csrf: store.generateId(16),
-        context: 'link',
+        context: "link",
         provider: provider.id,
         linkSessionId: session.sSessionId,
       };
       setOAuthStateCookie(res, state);
       return res.redirect(
-        provider.buildAuthUrl(settings, baseUrl(settings, req), Buffer.from(JSON.stringify(state)).toString('base64url'))
+        provider.buildAuthUrl(
+          settings,
+          baseUrl(settings, req),
+          Buffer.from(JSON.stringify(state)).toString("base64url"),
+        ),
       );
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/auth/:provider/callback', async (req, res, next) => {
+  app.get("/auth/:provider/callback", async (req, res, next) => {
     try {
       clearOAuthStateCookie(res);
       const settings = await getSettings();
       const provider = getProvider(req.params.provider);
-      if (!provider) return res.redirect('/?auth_error=provider_not_configured');
+      if (!provider)
+        return res.redirect("/?auth_error=provider_not_configured");
 
       // CSRF: the state echoed by the provider must match the cookie we set
       // when we left, and must have been minted for this provider.
       const storedRaw = getCookie(req, OAUTH_STATE_COOKIE);
       const stored = storedRaw ? decodeState(storedRaw) : null;
       if (!stored || stored.provider !== provider.id) {
-        return res.redirect('/?auth_error=invalid_state');
+        return res.redirect("/?auth_error=invalid_state");
       }
 
       // The setup wizard verifies credentials that are not saved yet, so it
       // runs before the is-this-provider-configured gate.
-      if (stored.context === 'setup') {
-        return res.redirect(await handleSetupCallback(req, res, provider, stored));
+      if (stored.context === "setup") {
+        return res.redirect(
+          await handleSetupCallback(req, res, provider, stored),
+        );
       }
 
       if (!isProviderConfigured(provider, settings)) {
-        return res.redirect('/?auth_error=provider_not_configured');
+        return res.redirect("/?auth_error=provider_not_configured");
       }
 
-      if (req.query.error) return res.redirect('/?auth_error=provider_denied');
-      const code = String(req.query.code ?? '');
-      if (!code) return res.redirect('/?auth_error=missing_code');
+      if (req.query.error) return res.redirect("/?auth_error=provider_denied");
+      const code = String(req.query.code ?? "");
+      if (!code) return res.redirect("/?auth_error=missing_code");
 
-      const returned = decodeState(String(req.query.state ?? ''));
+      const returned = decodeState(String(req.query.state ?? ""));
       if (!returned || stored.csrf !== returned.csrf) {
-        return res.redirect('/?auth_error=csrf_mismatch');
+        return res.redirect("/?auth_error=csrf_mismatch");
       }
 
-      const userInfo = await provider.fetchUserInfo(settings, baseUrl(settings, req), code);
-      if (!userInfo?.sub) return res.redirect('/?auth_error=userinfo_failed');
+      const userInfo = await provider.fetchUserInfo(
+        settings,
+        baseUrl(settings, req),
+        code,
+      );
+      if (!userInfo?.sub) return res.redirect("/?auth_error=userinfo_failed");
 
       // ── Link context: attach to the signed-in account ────────────────────
-      if (stored.context === 'link' && stored.linkSessionId) {
+      if (stored.context === "link" && stored.linkSessionId) {
         const linkSession = await store.getSession(db, stored.linkSessionId);
-        if (!linkSession) return res.redirect('/?auth_error=link_expired');
+        if (!linkSession) return res.redirect("/?auth_error=link_expired");
 
-        const owner = await store.findUserByIdentity(db, provider.id, userInfo.sub);
+        const owner = await store.findUserByIdentity(
+          db,
+          provider.id,
+          userInfo.sub,
+        );
         if (owner && owner !== linkSession.iUserId) {
           // Already someone else's login; two people must not share one.
-          return res.redirect('/account?link_error=already_linked');
+          return res.redirect("/account?link_error=already_linked");
         }
-        await store.ensureIdentity(db, linkSession.iUserId, provider.id, userInfo.sub, userInfo.email);
-        await db.query(`UPDATE identity_tbl_User SET email = COALESCE(email, ?) WHERE iUserId = ?`, [
-          userInfo.email,
+        await store.ensureIdentity(
+          db,
           linkSession.iUserId,
-        ]);
-        await emitEvent(db, 'identity.linked', {
+          provider.id,
+          userInfo.sub,
+          userInfo.email,
+        );
+        await db.query(
+          `UPDATE identity_tbl_User SET email = COALESCE(email, ?) WHERE iUserId = ?`,
+          [userInfo.email, linkSession.iUserId],
+        );
+        await emitEvent(db, "identity.linked", {
           iUserId: linkSession.iUserId,
           provider: provider.id,
           subject: userInfo.sub,
@@ -965,7 +1304,7 @@ export function buildApp() {
       const iUserId = await upsertUserForIdentity(
         provider.id,
         provider.verifiesEmailDomain(settings),
-        userInfo
+        userInfo,
       );
       const superAdmin = isSuperAdmin(provider, userInfo, settings);
       const dest = await finishLogin(req, res, settings, {
@@ -984,23 +1323,23 @@ export function buildApp() {
   // The bridge plugin verifies the ISP portal session, then redirects here
   // with a signed one-time code: ?code=<base64url-payload>&sig=<hmac-hex>.
 
-  app.get('/sso/callback', async (req, res, next) => {
+  app.get("/sso/callback", async (req, res, next) => {
     try {
       const settings = await getSettings();
-      const code = String(req.query.code ?? '');
-      const sig = String(req.query.sig ?? '');
-      if (!code || !sig) return res.redirect('/?auth_error=missing_sso_params');
+      const code = String(req.query.code ?? "");
+      const sig = String(req.query.sig ?? "");
+      if (!code || !sig) return res.redirect("/?auth_error=missing_sso_params");
 
       if (!settings.UISP_SSO_SECRET) {
-        logger.error('[sso] UISP_SSO_SECRET not configured');
-        return res.redirect('/?auth_error=sso_not_configured');
+        logger.error("[sso] UISP_SSO_SECRET not configured");
+        return res.redirect("/?auth_error=sso_not_configured");
       }
 
       const payload = verifySsoCode(settings.UISP_SSO_SECRET, code, sig);
-      if (!payload) return res.redirect('/?auth_error=invalid_sso_code');
+      if (!payload) return res.redirect("/?auth_error=invalid_sso_code");
 
       const nonceOk = await store.consumeNonce(db, payload.nonce, payload.exp);
-      if (!nonceOk) return res.redirect('/?auth_error=sso_replay');
+      if (!nonceOk) return res.redirect("/?auth_error=sso_replay");
 
       // Best-effort enrichment so the account has a label; the sign-in is
       // valid even when the CRM cannot be reached.
@@ -1009,39 +1348,44 @@ export function buildApp() {
       if (settings.UISP_BASE_URL && settings.UISP_CRM_APP_KEY_READ) {
         try {
           const resp = await fetch(
-            `${settings.UISP_BASE_URL.replace(/\/+$/, '')}/crm/api/v1.0/clients/${encodeURIComponent(payload.clientId)}`,
+            `${settings.UISP_BASE_URL.replace(/\/+$/, "")}/crm/api/v1.0/clients/${encodeURIComponent(payload.clientId)}`,
             {
               headers: {
-                'X-Auth-App-Key': settings.UISP_CRM_APP_KEY_READ,
-                Accept: 'application/json',
+                "X-Auth-App-Key": settings.UISP_CRM_APP_KEY_READ,
+                Accept: "application/json",
               },
-            }
+            },
           );
           if (resp.ok) {
             const data = (await resp.json()) as Record<string, unknown>;
             const contacts =
-              (data.contacts as Array<{ email?: string; isBilling?: boolean }>) ?? [];
+              (data.contacts as Array<{
+                email?: string;
+                isBilling?: boolean;
+              }>) ?? [];
             email =
-              contacts.find((c) => c.isBilling)?.email ?? contacts[0]?.email ?? null;
+              contacts.find((c) => c.isBilling)?.email ??
+              contacts[0]?.email ??
+              null;
             const company = data.companyName as string | null;
-            const first = (data.firstName as string) ?? '';
-            const last = (data.lastName as string) ?? '';
+            const first = (data.firstName as string) ?? "";
+            const last = (data.lastName as string) ?? "";
             name = company ?? (`${first} ${last}`.trim() || null);
           }
         } catch (err) {
-          logger.warn({ err }, '[sso] CRM enrichment failed');
+          logger.warn({ err }, "[sso] CRM enrichment failed");
         }
       }
 
-      const iUserId = await upsertUserForIdentity('uisp', false, {
+      const iUserId = await upsertUserForIdentity("uisp", false, {
         sub: payload.clientId,
-        email: email ?? '',
+        email: email ?? "",
         name: name ?? `ISP client ${payload.clientId}`,
       });
 
       const dest = await finishLogin(req, res, settings, {
         iUserId,
-        provider: 'uisp',
+        provider: "uisp",
         subject: payload.clientId,
         superAdmin: false,
       });
@@ -1067,18 +1411,23 @@ export function buildApp() {
    * login and written to both Session and AuthCode). Redemption NEVER
    * recalculates privilege from the email.
    */
-  app.post('/api/token', async (req, res, next) => {
+  app.post("/api/token", async (req, res, next) => {
     try {
       const settings = await requireTrustedApp(req, res);
       if (!settings) return;
       const { code, redirect_uri } = (req.body ?? {}) as Record<string, string>;
 
       if (!code || !redirect_uri) {
-        return res.status(400).json({ error: 'code and redirect_uri are required' });
+        return res
+          .status(400)
+          .json({ error: "code and redirect_uri are required" });
       }
 
       const consumed = await store.consumeAuthCode(db, code, redirect_uri);
-      if (!consumed) return res.status(400).json({ error: 'Invalid, expired, or reused code' });
+      if (!consumed)
+        return res
+          .status(400)
+          .json({ error: "Invalid, expired, or reused code" });
 
       // The app just proved it is live. Record it whether or not it has
       // registered a webhook — an app that logs users in but never listens
@@ -1086,16 +1435,23 @@ export function buildApp() {
       try {
         await store.recordAppOrigin(db, new URL(redirect_uri).origin);
       } catch (err) {
-        logger.warn({ err }, '[apps] could not record calling app origin');
+        logger.warn({ err }, "[apps] could not record calling app origin");
       }
 
       const user = await store.getUser(db, consumed.iUserId);
-      if (!user) return res.status(400).json({ error: 'Unknown user' });
+      if (!user) return res.status(400).json({ error: "Unknown user" });
       const identities = await store.listIdentities(db, consumed.iUserId);
 
+      const appToken = await createAppSession(
+        db,
+        consumed,
+        new URL(redirect_uri).origin,
+      );
+      res.set("Cache-Control", "no-store");
       return res.json({
+        appSession: { token: appToken },
         user: {
-          iUserId: user.iUserId,
+          iUserId: safeId(user.iUserId),
           email: user.email,
           displayName: user.displayName,
           superAdmin: consumed.bSuperAdmin,
@@ -1121,32 +1477,39 @@ export function buildApp() {
    * it, so the app holds one less configured value: its integration is
    * established by running, not by an admin remembering to add a row.
    */
-  app.post('/api/apps/register', async (req, res, next) => {
+  app.post("/api/apps/register", async (req, res, next) => {
     try {
       const settings = await requireTrustedApp(req, res);
       if (!settings) return;
 
       const body = (req.body ?? {}) as Record<string, string>;
       const webhookUrl = validateRedirectUri(
-        String(body.webhook_url ?? ''),
+        String(body.webhook_url ?? ""),
         settings,
-        config.NODE_ENV
+        config.NODE_ENV,
       );
       if (!webhookUrl) {
         return res.status(400).json({
           error:
-            'webhook_url must be an https URL under the configured parent domain.',
+            "webhook_url must be an https URL under the configured parent domain.",
         });
       }
-      const name = String(body.name ?? '').trim().slice(0, 128) || null;
+      const name =
+        String(body.name ?? "")
+          .trim()
+          .slice(0, 128) || null;
       const origin = new URL(webhookUrl).origin;
 
-      const { secret } = await store.registerApp(db, { origin, name, webhookUrl });
+      const { secret } = await store.registerApp(db, {
+        origin,
+        name,
+        webhookUrl,
+      });
       logger.info(`[apps] registered ${origin} → ${webhookUrl}`);
 
       // Prove the endpoint is reachable straight away rather than leaving the
       // first real revocation to discover it is not.
-      await emitEvent(db, 'ping', { origin }, { onlyOrigin: origin });
+      await emitEvent(db, "ping", { origin }, { onlyOrigin: origin });
 
       // POC contract: deliveries are trusted by network policy (the app's
       // /id/events endpoint allowlists id's egress IPv4s; TLS protects the
@@ -1159,8 +1522,8 @@ export function buildApp() {
         secret,
         events: EVENT_TYPES,
         signature: {
-          header: 'X-Id-Signature',
-          scheme: 'sha256=HMAC_SHA256(secret, `${X-Id-Timestamp}.${rawBody}`)',
+          header: "X-Id-Signature",
+          scheme: "sha256=HMAC_SHA256(secret, `${X-Id-Timestamp}.${rawBody}`)",
           toleranceSeconds: 300,
           required: false,
         },
@@ -1178,12 +1541,14 @@ export function buildApp() {
    * Reading forward from the last event it processed closes it, and means an
    * app never needs a timer of its own.
    */
-  app.get('/api/events', async (req, res, next) => {
+  app.get("/api/events", async (req, res, next) => {
     try {
       if (!(await requireTrustedApp(req, res))) return;
       const since = Number(req.query.since ?? 0);
       if (!Number.isFinite(since) || since < 0) {
-        return res.status(400).json({ error: 'since must be a non-negative event id' });
+        return res
+          .status(400)
+          .json({ error: "since must be a non-negative event id" });
       }
       const items = await store.listEventsSince(db, since);
       return res.json({ items });
@@ -1192,7 +1557,9 @@ export function buildApp() {
     }
   });
 
-  // ── Central user directory (CIDR-trusted, server-only) ────────────────────
+  installPlatformRoutes(app, db, requireTrustedApp);
+
+  // ── Central user directory (trusted server + SUPER_ADMIN actor) ──────────
   //
   // Lets a trusted application (AidaAdmin) create, locate, and select
   // central users by iUserId without direct MySQL access or duplicate
@@ -1210,51 +1577,78 @@ export function buildApp() {
    * an identity — the same email-match path every login uses. Untrusted
    * providers can never claim a UID by asserted email.
    */
-  app.post('/api/directory/users', async (req, res, next) => {
+  app.post("/api/directory/users", async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const body = (req.body ?? {}) as Record<string, string>;
-      const email = String(body.email ?? '').trim().toLowerCase();
-      if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) || email.length > 255) {
-        return res.status(400).json({ error: 'A valid email is required' });
+      const email = String(body.email ?? "")
+        .trim()
+        .toLowerCase();
+      if (
+        !email ||
+        !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email) ||
+        email.length > 255
+      ) {
+        return res.status(400).json({ error: "A valid email is required" });
       }
-      const displayName = String(body.displayName ?? '').trim().slice(0, 255) || null;
-      const idempotencyKey = String(body.idempotencyKey ?? '').trim().slice(0, 128) || null;
-      const user = await store.ensureDirectoryUser(db, { email, displayName, idempotencyKey });
+      const displayName =
+        String(body.displayName ?? "")
+          .trim()
+          .slice(0, 255) || null;
+      const idempotencyKey =
+        String(body.idempotencyKey ?? "")
+          .trim()
+          .slice(0, 128) || null;
+      const user = await store.ensureDirectoryUser(db, {
+        email,
+        displayName,
+        idempotencyKey,
+        actorUserId: res.locals.platformActor.iUserId,
+      });
       return res.json(user);
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/directory/users/:iUserId', async (req, res, next) => {
+  app.get("/api/directory/users/:iUserId", async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
+      if (!(await requireTrustedApp(req, res))) return;
       const iUserId = Number(req.params.iUserId);
-      if (!Number.isInteger(iUserId) || iUserId <= 0) {
-        return res.status(400).json({ error: 'Invalid iUserId' });
+      if (!Number.isSafeInteger(iUserId) || iUserId <= 0) {
+        return res.status(400).json({ error: "Invalid iUserId" });
       }
       const user = await store.getDirectoryUser(db, iUserId);
-      if (!user) return res.status(404).json({ error: 'Not found' });
+      if (!user) return res.status(404).json({ error: "Not found" });
       return res.json(user);
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/directory/users', async (req, res, next) => {
+  app.get("/api/directory/users", async (req, res, next) => {
     try {
-      if (!(await requireTrustedPeer(req, res))) return;
-      const query = String(req.query.query ?? '').trim().slice(0, 255);
+      if (!(await requireTrustedApp(req, res))) return;
+      const query = String(req.query.query ?? "")
+        .trim()
+        .slice(0, 255);
       const limit = Number(req.query.limit ?? 25);
       const cursor = Number(req.query.cursor ?? 0);
-      if (!Number.isFinite(limit) || limit < 1 || limit > 100) {
-        return res.status(400).json({ error: 'limit must be between 1 and 100' });
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 100) {
+        return res
+          .status(400)
+          .json({ error: "limit must be between 1 and 100" });
       }
-      if (!Number.isFinite(cursor) || cursor < 0) {
-        return res.status(400).json({ error: 'cursor must be a non-negative user id' });
+      if (!Number.isSafeInteger(cursor) || cursor < 0) {
+        return res
+          .status(400)
+          .json({ error: "cursor must be a non-negative user id" });
       }
-      const page = await store.searchDirectoryUsers(db, { query, limit, cursor });
+      const page = await store.searchDirectoryUsers(db, {
+        query,
+        limit,
+        cursor,
+      });
       return res.json(page);
     } catch (err) {
       next(err);
@@ -1263,10 +1657,10 @@ export function buildApp() {
 
   // ── Own account ────────────────────────────────────────────────────────────
 
-  app.get('/api/me', async (req, res, next) => {
+  app.get("/api/me", async (req, res, next) => {
     try {
       const session = await resolveSession(req);
-      if (!session) return res.status(401).json({ error: 'Not logged in' });
+      if (!session) return res.status(401).json({ error: "Not logged in" });
       const user = await store.getUser(db, session.iUserId);
       const identities = await store.listIdentities(db, session.iUserId);
       const settings = await getSettings();
@@ -1278,12 +1672,14 @@ export function buildApp() {
         identities: identities.map((i) => ({
           iIdentityId: i.iIdentityId,
           provider: i.provider,
-          label: i.email ?? (i.provider === 'uisp' ? `ISP client ${i.subject}` : i.subject),
+          label:
+            i.email ??
+            (i.provider === "uisp" ? `ISP client ${i.subject}` : i.subject),
           dtCreated: i.dtCreated,
-          removable: i.provider !== 'uisp',
+          removable: i.provider !== "uisp",
         })),
         linkable: availableLoginMethods(settings)
-          .filter((m) => m.kind === 'oauth')
+          .filter((m) => m.kind === "oauth")
           .map((m) => ({ id: m.id, label: m.label })),
       });
     } catch (err) {
@@ -1291,29 +1687,31 @@ export function buildApp() {
     }
   });
 
-  app.delete('/api/identities/:id', async (req, res, next) => {
+  app.delete("/api/identities/:id", async (req, res, next) => {
     try {
       const session = await resolveSession(req);
-      if (!session) return res.status(401).json({ error: 'Not logged in' });
+      if (!session) return res.status(401).json({ error: "Not logged in" });
 
       const id = Number(req.params.id);
       const identity = await store.getIdentity(db, id);
       if (!identity || identity.iUserId !== session.iUserId) {
         // Don't disclose whether the id exists on someone else's account.
-        return res.status(404).json({ error: 'Not found' });
+        return res.status(404).json({ error: "Not found" });
       }
-      if (identity.provider === 'uisp') {
+      if (identity.provider === "uisp") {
         return res.status(400).json({
-          error: 'Your ISP sign-in is managed by your provider and cannot be removed here.',
+          error:
+            "Your ISP sign-in is managed by your provider and cannot be removed here.",
         });
       }
       if ((await store.countIdentities(db, session.iUserId)) <= 1) {
         return res.status(400).json({
-          error: 'This is your only sign-in method — link another before removing it.',
+          error:
+            "This is your only sign-in method — link another before removing it.",
         });
       }
       await store.deleteIdentity(db, id);
-      await emitEvent(db, 'identity.unlinked', {
+      await emitEvent(db, "identity.unlinked", {
         iUserId: session.iUserId,
         provider: identity.provider,
         subject: identity.subject,
@@ -1335,29 +1733,32 @@ export function buildApp() {
         await store.revokeSession(db, session.sSessionId);
         // The app sessions this login spawned are independent of ours, so
         // signing out here only means anything if the apps hear about it.
-        await emitEvent(db, 'session.revoked', {
+        await emitEvent(db, "session.revoked", {
           iUserId: session.iUserId,
-          scope: 'one',
+          scope: "one",
           sessionId: session.sSessionId,
         });
       }
       clearSessionCookie(res, settings);
-      return res.redirect('/');
+      return res.redirect("/");
     } catch (err) {
       next(err);
     }
   };
-  app.post('/logout', logoutHandler);
-  app.get('/logout', logoutHandler);
+  app.post("/logout", logoutHandler);
+  app.get("/logout", logoutHandler);
 
   // Revoke every session for this user, everywhere.
-  app.post('/api/logout-everywhere', async (req, res, next) => {
+  app.post("/api/logout-everywhere", async (req, res, next) => {
     try {
       const settings = await getSettings();
       const session = await resolveSession(req);
-      if (!session) return res.status(401).json({ error: 'Not logged in' });
+      if (!session) return res.status(401).json({ error: "Not logged in" });
       const n = await store.revokeAllSessions(db, session.iUserId);
-      await emitEvent(db, 'session.revoked', { iUserId: session.iUserId, scope: 'all' });
+      await emitEvent(db, "session.revoked", {
+        iUserId: session.iUserId,
+        scope: "all",
+      });
       clearSessionCookie(res, settings);
       return res.json({ ok: true, revoked: n });
     } catch (err) {
@@ -1369,17 +1770,17 @@ export function buildApp() {
 
   async function requireSuperAdmin(
     req: express.Request,
-    res: express.Response
+    res: express.Response,
   ): Promise<store.SessionRow | null> {
     const session = await resolveSession(req);
     if (!session?.bSuperAdmin) {
-      res.status(403).json({ error: 'Forbidden' });
+      res.status(403).json({ error: "Forbidden" });
       return null;
     }
     return session;
   }
 
-  app.get('/api/admin/config', async (req, res, next) => {
+  app.get("/api/admin/config", async (req, res, next) => {
     try {
       if (!(await requireSuperAdmin(req, res))) return;
       const rows = await settingsStore.listForAdmin();
@@ -1388,7 +1789,9 @@ export function buildApp() {
       // What is actually deciding `base` — a pinned value only counts when
       // it is usable; an unparseable one falls through to the request like
       // any other missing setting.
-      const pinnedBase = normalizeBaseUrl(settings.APP_BASE_URL ?? '', { allowHttp: true });
+      const pinnedBase = normalizeBaseUrl(settings.APP_BASE_URL ?? "", {
+        allowHttp: true,
+      });
       const knownProviders = PROVIDERS.map((p) => ({
         id: p.id,
         label: p.label,
@@ -1405,10 +1808,10 @@ export function buildApp() {
         // then follow the URL this console was reached on, which is what a
         // zero-config instance runs on.
         appBaseUrlSource: pinnedBase
-          ? settingsStore.isOverridden('APP_BASE_URL')
-            ? 'environment'
-            : 'store'
-          : 'request',
+          ? settingsStore.isOverridden("APP_BASE_URL")
+            ? "environment"
+            : "store"
+          : "request",
         // Resolved rather than raw, so the list form and the PARENT_DOMAIN
         // fallback are both visible for what they are.
         superAdminDomains: superAdminDomains(settings),
@@ -1418,13 +1821,13 @@ export function buildApp() {
     }
   });
 
-  app.put('/api/admin/config/:key', async (req, res, next) => {
+  app.put("/api/admin/config/:key", async (req, res, next) => {
     try {
       const session = await requireSuperAdmin(req, res);
       if (!session) return;
-      const key = String(req.params.key ?? '').trim();
+      const key = String(req.params.key ?? "").trim();
       if (!/^[A-Za-z0-9_.-]{1,128}$/.test(key)) {
-        return res.status(400).json({ error: 'Invalid key' });
+        return res.status(400).json({ error: "Invalid key" });
       }
       // An environment override is the deployment's decision, not this
       // console's: saying so beats accepting a write that would never take
@@ -1433,19 +1836,19 @@ export function buildApp() {
         return res.status(409).json({
           error:
             `${key} is set in this app's environment, which overrides the settings ` +
-            'store. Change it there (and restart) or unset it to manage it here.',
+            "store. Change it there (and restart) or unset it to manage it here.",
         });
       }
-      const value = String((req.body ?? {}).value ?? '');
+      const value = String((req.body ?? {}).value ?? "");
       await settingsStore.set(key, value);
-      logger.warn(`[admin] user ${session.iUserId} set oAuthConfig ${key}`);
+      logger.warn(`[admin] user ${session.iUserId} set cfg_tbl_Setting ${key}`);
       return res.json({ ok: true });
     } catch (err) {
       next(err);
     }
   });
 
-  app.get('/api/admin/users', async (req, res, next) => {
+  app.get("/api/admin/users", async (req, res, next) => {
     try {
       if (!(await requireSuperAdmin(req, res))) return;
       return res.json({ items: await store.adminListUsers(db) });
@@ -1455,14 +1858,16 @@ export function buildApp() {
   });
 
   // Revocation is the only way a login ends, so the admin can end them all.
-  app.post('/api/admin/users/:id/revoke-sessions', async (req, res, next) => {
+  app.post("/api/admin/users/:id/revoke-sessions", async (req, res, next) => {
     try {
       const session = await requireSuperAdmin(req, res);
       if (!session) return;
       const iUserId = Number(req.params.id);
       const n = await store.revokeAllSessions(db, iUserId);
-      await emitEvent(db, 'session.revoked', { iUserId, scope: 'all' });
-      logger.warn(`[admin] user ${session.iUserId} revoked ${n} session(s) of user ${iUserId}`);
+      await emitEvent(db, "session.revoked", { iUserId, scope: "all" });
+      logger.warn(
+        `[admin] user ${session.iUserId} revoked ${n} session(s) of user ${iUserId}`,
+      );
       return res.json({ ok: true, revoked: n });
     } catch (err) {
       next(err);
@@ -1478,7 +1883,7 @@ export function buildApp() {
    *   unverified     — registered, nothing delivered successfully yet
    *   listening      — registered and delivering
    */
-  app.get('/api/admin/apps', async (req, res, next) => {
+  app.get("/api/admin/apps", async (req, res, next) => {
     try {
       if (!(await requireSuperAdmin(req, res))) return;
       const [apps, counts] = await Promise.all([
@@ -1487,11 +1892,12 @@ export function buildApp() {
       ]);
       const items = apps.map((a) => {
         const c = counts[a.sOrigin] ?? { pending: 0, abandoned: 0 };
-        let status: 'listening' | 'failing' | 'unverified' | 'not_integrated';
-        if (!a.sWebhookUrl) status = 'not_integrated';
-        else if (c.abandoned > 0 || a.iConsecutiveFailures >= FAILING_THRESHOLD) status = 'failing';
-        else if (!a.dtLastDeliveryOk) status = 'unverified';
-        else status = 'listening';
+        let status: "listening" | "failing" | "unverified" | "not_integrated";
+        if (!a.sWebhookUrl) status = "not_integrated";
+        else if (c.abandoned > 0 || a.iConsecutiveFailures >= FAILING_THRESHOLD)
+          status = "failing";
+        else if (!a.dtLastDeliveryOk) status = "unverified";
+        else status = "listening";
         return { ...a, status, pending: c.pending, abandoned: c.abandoned };
       });
       return res.json({ items, eventTypes: EVENT_TYPES });
@@ -1501,16 +1907,18 @@ export function buildApp() {
   });
 
   /** Re-test an endpoint on demand — the "is it me or them" button. */
-  app.post('/api/admin/apps/ping', async (req, res, next) => {
+  app.post("/api/admin/apps/ping", async (req, res, next) => {
     try {
       const session = await requireSuperAdmin(req, res);
       if (!session) return;
-      const origin = String((req.body ?? {}).origin ?? '');
+      const origin = String((req.body ?? {}).origin ?? "");
       const secret = await store.getAppSecret(db, origin);
       if (!secret) {
-        return res.status(400).json({ error: 'That app has not registered a webhook yet.' });
+        return res
+          .status(400)
+          .json({ error: "That app has not registered a webhook yet." });
       }
-      await emitEvent(db, 'ping', { origin }, { onlyOrigin: origin });
+      await emitEvent(db, "ping", { origin }, { onlyOrigin: origin });
       return res.json({ ok: true });
     } catch (err) {
       next(err);
@@ -1522,32 +1930,37 @@ export function buildApp() {
    * their own mapping — otherwise the retired id user would linger in every
    * app that had seen it.
    */
-  app.post('/api/admin/users/:id/merge', async (req, res, next) => {
+  app.post("/api/admin/users/:id/merge", async (req, res, next) => {
     try {
       const session = await requireSuperAdmin(req, res);
       if (!session) return;
       const fromUserId = Number(req.params.id);
       const toUserId = Number((req.body ?? {}).intoUserId);
       if (!Number.isInteger(fromUserId) || !Number.isInteger(toUserId)) {
-        return res.status(400).json({ error: 'Both user ids are required.' });
+        return res.status(400).json({ error: "Both user ids are required." });
       }
       if (fromUserId === toUserId) {
-        return res.status(400).json({ error: 'Cannot merge a user into itself.' });
+        return res
+          .status(400)
+          .json({ error: "Cannot merge a user into itself." });
       }
       const [from, to] = await Promise.all([
         store.getUser(db, fromUserId),
         store.getUser(db, toUserId),
       ]);
-      if (!from || !to) return res.status(404).json({ error: 'Unknown user.' });
+      if (!from || !to) return res.status(404).json({ error: "Unknown user." });
 
       const result = await store.mergeUsers(db, fromUserId, toUserId);
-      await emitEvent(db, 'user.merged', { fromUserId, toUserId });
+      await emitEvent(db, "user.merged", { fromUserId, toUserId });
       // The retired user's sessions ended as part of the merge; apps need
       // that as its own signal since they key sessions on the id user.
-      await emitEvent(db, 'session.revoked', { iUserId: fromUserId, scope: 'all' });
+      await emitEvent(db, "session.revoked", {
+        iUserId: fromUserId,
+        scope: "all",
+      });
       logger.warn(
         `[admin] user ${session.iUserId} merged id user ${fromUserId} into ${toUserId} ` +
-          `(${result.movedIdentities} identities moved, ${result.revokedSessions} sessions revoked)`
+          `(${result.movedIdentities} identities moved, ${result.revokedSessions} sessions revoked)`,
       );
       return res.json({ ok: true, ...result });
     } catch (err) {
@@ -1555,27 +1968,28 @@ export function buildApp() {
     }
   });
 
-  app.delete('/api/admin/identities/:id', async (req, res, next) => {
+  app.delete("/api/admin/identities/:id", async (req, res, next) => {
     try {
       const session = await requireSuperAdmin(req, res);
       if (!session) return;
       const id = Number(req.params.id);
       const identity = await store.getIdentity(db, id);
-      if (!identity) return res.status(404).json({ error: 'Not found' });
+      if (!identity) return res.status(404).json({ error: "Not found" });
       // Same floor as self-service: never strip a user's last way in.
       if ((await store.countIdentities(db, identity.iUserId)) <= 1) {
         return res.status(400).json({
-          error: "That is the user's only sign-in method — removing it would lock them out.",
+          error:
+            "That is the user's only sign-in method — removing it would lock them out.",
         });
       }
       await store.deleteIdentity(db, id);
-      await emitEvent(db, 'identity.unlinked', {
+      await emitEvent(db, "identity.unlinked", {
         iUserId: identity.iUserId,
         provider: identity.provider,
         subject: identity.subject,
       });
       logger.warn(
-        `[admin] user ${session.iUserId} unlinked identity ${id} (${identity.provider}) from user ${identity.iUserId}`
+        `[admin] user ${session.iUserId} unlinked identity ${id} (${identity.provider}) from user ${identity.iUserId}`,
       );
       return res.json({ ok: true });
     } catch (err) {
@@ -1586,7 +2000,12 @@ export function buildApp() {
   // ── Error handler ──────────────────────────────────────────────────────────
 
   app.use(
-    (err: unknown, req: express.Request, res: express.Response, _next: express.NextFunction) => {
+    (
+      err: unknown,
+      req: express.Request,
+      res: express.Response,
+      _next: express.NextFunction,
+    ) => {
       logger.error(err);
       // A settings store that cannot answer is a configuration fault, and
       // saying so beats a 500 or — worse — a page that renders as though
@@ -1594,13 +2013,15 @@ export function buildApp() {
       // everything else gets the same sentence as JSON.
       if (err instanceof SettingsUnavailableError) {
         res.status(503);
-        if (req.accepts(['json', 'html']) === 'html') {
-          return res.sendFile(path.join(publicDir, 'unavailable.html'));
+        if (req.accepts(["json", "html"]) === "html") {
+          return res.sendFile(path.join(publicDir, "unavailable.html"));
         }
         return res.json({ error: err.message, reason: err.reason });
       }
-      res.status(500).json({ error: 'Internal server error' });
-    }
+      if (err instanceof store.DirectoryConflictError)
+        return res.status(409).json({ error: err.message });
+      res.status(500).json({ error: "Internal server error" });
+    },
   );
 
   return { app, db, settingsStore };

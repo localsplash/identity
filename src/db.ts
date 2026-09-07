@@ -2,9 +2,9 @@ import mysql from 'mysql2/promise';
 import { Settings } from './settings';
 
 /**
- * The MySQL pool for id_db.
+ * The MySQL pool for platform_db.
  *
- * Its coordinates are settings like any other — a row in `oAuthConfig`, or
+ * Its coordinates are settings like any other — a row in `cfg_tbl_Setting`, or
  * an environment override — rather than a second configuration file. That
  * means they are not known when the app is constructed, only when the
  * settings store is first read, so the pool is created lazily on first use.
@@ -46,8 +46,8 @@ export function dbCoordinates(settings: Settings): DbCoordinates | null {
 export class DatabaseNotConfiguredError extends Error {
   constructor() {
     super(
-      'The id_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
-        '(and DB_PASSWORD) in the oAuthConfig settings table, or set them in ' +
+      'The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
+        '(and DB_PASSWORD) in the cfg_tbl_Setting settings table, or set them in ' +
         "this app's environment, then restart."
     );
     this.name = 'DatabaseNotConfiguredError';
@@ -75,6 +75,8 @@ export function getDb(resolve: () => Promise<DbCoordinates | null>): mysql.Pool 
           waitForConnections: true,
           connectionLimit: 5,
           timezone: 'Z',
+          supportBigNumbers: true,
+          bigNumberStrings: false,
         });
         return pool;
       })().finally(() => {

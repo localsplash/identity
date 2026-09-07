@@ -1,32 +1,103 @@
-# Standalone dev — for the full stack use EchoOrchestrator instead.
+# Everything this service needs, in one file.
 #
-# The identity service reads everything it needs from the NocoDB base
-# IdentityBase (table auth_tbl_Settings), including the coordinates of the
-# identity database. The only things stated here are how to reach that base.
+# Identity owns its data: the MySQL below is its own, on a private network,
+# and it applies its own schema to it. The only thing it expects to find
+# already running is a NocoDB, which holds the settings table every
+# application on the platform reads.
+#
+# Nothing here has to be filled in by hand. `scripts/install.sh` writes the
+# database passwords into .env once, and the first-run wizard at /setup
+# collects the NocoDB address, the API token and the trusted network from a
+# browser and saves them to the identity-config volume.
 services:
   identity:
     build: .
     container_name: identity
     hostname: identity
+    depends_on:
+      db:
+        condition: service_healthy
     environment:
       PORT: "3200"
-      # The two things a deployment states.
-      NOCODB_BASE_URL: ${NOCODB_BASE_URL:-http://host.docker.internal:18090}
+
+      # Where the settings live. Left empty on a fresh install: /setup asks
+      # for them and writes them to /data/config.json on the volume below,
+      # so a deployment does not have to state them here at all. Stated
+      # here, they win and the wizard skips straight to claiming.
+      NOCODB_BASE_URL: ${NOCODB_BASE_URL:-}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
-      # Optional overrides of auth_tbl_Settings rows. Blank counts as unset,
+
+      # This app's own database — the service below, not a shared one.
+      # These are pinned deliberately: the coordinates of a container in
+      # this same file are not something a wizard should be asking about.
+      DB_HOST: ${DB_HOST:-db}
+      DB_PORT: ${DB_PORT:-3306}
+      DB_USER: ${DB_USER:-identity}
+      DB_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
+      DB_NAME: ${DB_NAME:-platform_db}
+
+      # Optional overrides of cfg_tbl_Setting rows. Blank counts as unset,
       # so leaving these alone keeps the zero-config path: the public base
-      # URL is whatever URL the browser reached this service on, the trusted
-      # network and the database coordinates come from the settings table,
-      # and the first-run wizard collects what is missing.
+      # URL is whatever URL the browser reached this service on, and the
+      # trusted network comes from the settings table.
+      # How an application proves it may redeem a handoff code at /api/token.
+      #
+      # 'cidr' — the default — trusts the network allowlist alone, and never
+      # looks at IDENTITY_CLIENT_SECRET. That works when the calling app's
+      # socket peer is genuinely inside trustedCIDR. Echo's containers are not:
+      # they reach this service through the public hostname, so the peer is the
+      # reverse proxy on a Docker bridge, and every token exchange was refused.
+      #
+      # 'dual' keeps the CIDR path first and falls back to the shared secret,
+      # which is how EchoWeb authenticates. Narrow this back to 'cidr' if the
+      # apps ever sit inside the trusted network.
+      IDENTITY_APP_AUTH_MODE: ${IDENTITY_APP_AUTH_MODE:-dual}
       IDENTITY_TRUSTED_NETWORK: ${IDENTITY_TRUSTED_NETWORK:-}
-      IDENTITY_TRUSTED_PROXY_CIDRS: ${IDENTITY_TRUSTED_PROXY_CIDRS:-}
-      DB_HOST: ${DB_HOST:-}
-      DB_PORT: ${DB_PORT:-}
-      DB_USER: ${DB_USER:-}
-      DB_PASSWORD: ${DB_PASSWORD:-}
-      DB_NAME: ${DB_NAME:-}
       APP_BASE_URL: ${APP_BASE_URL:-}
       PARENT_DOMAIN: ${PARENT_DOMAIN:-}
+    volumes:
+      # Holds config.json: the address of the settings store, and nothing
+      # else. Survives a rebuild, so an instance is set up exactly once.
+      - identity-config:/data
     ports:
+      # Loopback only. Public traffic arrives through a reverse proxy on
+      # npm_network, which reaches this container as http://identity:3200.
+      # Publishing to 127.0.0.1 is for debugging from the host.
       - "127.0.0.1:3200:3200"
+    networks:
+      - default
+      - npm_network
     restart: unless-stopped
+
+  db:
+    image: mysql:8.4
+    container_name: identity-db
+    environment:
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?missing — run scripts/install.sh once to generate it}
+      MYSQL_DATABASE: ${DB_NAME:-platform_db}
+      MYSQL_USER: ${DB_USER:-identity}
+      MYSQL_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
+    volumes:
+      - identity-db-data:/var/lib/mysql
+    healthcheck:
+      # identity waits on this: it applies migrations on the first tick after
+      # boot, and a MySQL still initialising would only make that retry.
+      test: ["CMD-SHELL", "mysqladmin ping -h 127.0.0.1 -u root -p\"$$MYSQL_ROOT_PASSWORD\" --silent"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+    # Deliberately not on npm_network and with no published port: nothing
+    # outside this compose project has any business reaching it.
+    networks:
+      - default
+    restart: unless-stopped
+
+volumes:
+  identity-config:
+  identity-db-data:
+
+networks:
+  # Created by the reverse-proxy stack; this file only joins it.
+  npm_network:
+    external: true

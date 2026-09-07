@@ -1,9 +1,9 @@
 {
   "openapi": "3.1.0",
   "info": {
-    "title": "id — X.TLD application integration contract",
-    "version": "1.0.0",
-    "description": "The application-handoff protocol of the `id` identity service for first-party applications under the configured PARENT_DOMAIN (written `X.TLD` throughout; `localsplash.ai` URLs anywhere are deployment examples only, never normative).\n\nThis is id's own protocol, NOT standard OIDC. There is no application secret and no webhook HMAC in the POC contract: browser authorization is public, and every server-only endpoint is trusted by TLS plus an explicit IPv4/CIDR network policy.\n\n## Network trust (server-only endpoints)\n\n`POST /api/token`, `POST /api/apps/register`, `GET /api/events`, and all `/api/directory/*` endpoints accept a request only when the caller's resolved IPv4 peer is inside the `ID_TRUSTED_APP_CIDRS` allowlist (comma-separated IPv4 CIDRs; `/32` and bare addresses supported). The TCP socket peer is authoritative; `X-Forwarded-For` is honoured only when the direct peer is inside `ID_TRUSTED_PROXY_CIDRS`, and then only across trusted hops evaluated right-to-left. Malformed, IPv6, IPv4-mapped-IPv6, and non-allowlisted addresses are rejected deterministically with a generic 403. This authenticates a trusted server/network, not an individual application: applications sharing an allowed egress IP can call the same endpoints — accepted for the first-party POC on a controlled host, and NOT suitable for unrelated or customer-hosted X.TLD applications.\n\n## Flow\n\n1. `GET /authorize?redirect_uri&state` (public, browser). `redirect_uri` must be HTTPS on X.TLD or a subdomain.\n2. id redirects back with a one-time `code` (and the echoed `state`).\n3. The application's CIDR-trusted server redeems it at `POST /api/token` with the exact `redirect_uri`.\n4. The same server registers at `POST /api/apps/register` and catches up from `GET /api/events?since`.\n\n## superAdmin provenance (pinned)\n\n`user.superAdmin` in the token response is session-scoped and never stored on `identity_tbl_User`. For an existing SSO session, `/authorize` copies `identity_tbl_Session.bSuperAdmin` into `identity_tbl_AuthCode`; redemption returns the consumed code's `bSuperAdmin`. For a fresh provider login, id calculates the value once and writes the same value to both Session and AuthCode. Redemption NEVER recalculates privilege from the email.\n\n## Event delivery (outbound id → application)\n\nid POSTs events to the registered `webhook_url`. The receiving application's endpoint allowlists id's egress IPv4/CIDRs; TLS protects the transport. Deliveries carry `X-Id-Event`, `X-Id-Event-Id`, and `X-Id-Timestamp` headers; event ids and timestamps are what idempotency/replay handling keys on (the same event id can arrive more than once). An `X-Id-Signature` HMAC header MAY be present for legacy receivers and is OPTIONAL to verify — it is not part of the POC contract."
+    "title": "Platform Identity \u2014 X.TLD application integration contract",
+    "version": "2.0.0",
+    "description": "Identity is the sole platform authority for users, provider identities, tenants, memberships, and SSO/application browser sessions. Trusted server admission uses trustedCIDR (default) or configured secret/dual compatibility mode. Directory operations also require an application-session bearer actor. SUPER_ADMIN uses provider-proven session authority unless explicitly granted or removed by another Super Admin; directory email never grants global access. See PLATFORM_CONTRACT.md for rollout, role, online introspection, and data preservation rules."
   },
   "servers": [
     {
@@ -23,22 +23,31 @@
             "in": "query",
             "required": true,
             "description": "HTTPS URL whose host is X.TLD or any subdomain of it. Nothing else is accepted.",
-            "schema": { "type": "string", "format": "uri" }
+            "schema": {
+              "type": "string",
+              "format": "uri"
+            }
           },
           {
             "name": "state",
             "in": "query",
             "required": false,
             "description": "Opaque value echoed back verbatim on the redirect.",
-            "schema": { "type": "string" }
+            "schema": {
+              "type": "string"
+            }
           }
         ],
         "responses": {
           "302": {
             "description": "Redirect to `redirect_uri` with `?code=<one-time>&state=<echoed>`."
           },
-          "200": { "description": "Login page (no SSO session yet)." },
-          "400": { "description": "Invalid redirect_uri." }
+          "200": {
+            "description": "Login page (no SSO session yet)."
+          },
+          "400": {
+            "description": "Invalid redirect_uri."
+          }
         }
       }
     },
@@ -46,12 +55,14 @@
       "post": {
         "operationId": "redeemCode",
         "summary": "Redeem a one-time handoff code (CIDR-trusted server only)",
-        "description": "The `redirect_uri` must exactly match the one the code was minted for (exact redirect binding). Codes are single-use and expire 5 minutes after minting; a replayed, expired, or re-bound code yields 400. No client secret is required by the POC contract — admission is the IPv4/CIDR policy. `user.superAdmin` is the consumed code's `bSuperAdmin` (see superAdmin provenance); it is never recalculated from the email at redemption.",
+        "description": "The `redirect_uri` must exactly match the one the code was minted for (exact redirect binding). Codes are single-use and expire 5 minutes after minting; a replayed, expired, or re-bound code yields 400. No client secret is required by the POC contract \u2014 admission is the IPv4/CIDR policy. `user.superAdmin` is the consumed code's `bSuperAdmin` (see superAdmin provenance); it is never recalculated from the email at redemption.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/TokenRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/TokenRequest"
+              }
             }
           }
         },
@@ -60,20 +71,30 @@
             "description": "The signed-in identity.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/TokenResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/TokenResponse"
+                }
               }
             }
           },
           "400": {
             "description": "Missing fields, or an invalid, expired, reused, or re-bound code.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           }
         }
@@ -88,7 +109,9 @@
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/RegistrationRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/RegistrationRequest"
+              }
             }
           }
         },
@@ -97,20 +120,30 @@
             "description": "Registration accepted.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/RegistrationResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/RegistrationResponse"
+                }
               }
             }
           },
           "400": {
             "description": "Invalid webhook_url.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           }
         }
@@ -127,7 +160,11 @@
             "in": "query",
             "required": false,
             "description": "Last event id already processed; defaults to 0.",
-            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
           }
         ],
         "responses": {
@@ -135,20 +172,30 @@
             "description": "Ordered events.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/EventsResponse" }
+                "schema": {
+                  "$ref": "#/components/schemas/EventsResponse"
+                }
               }
             }
           },
           "400": {
             "description": "Invalid `since`.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           }
         }
@@ -158,37 +205,54 @@
       "post": {
         "operationId": "ensureDirectoryUser",
         "summary": "Idempotently ensure a central user by email (CIDR-trusted server only)",
-        "description": "Creates the user if no user holds the normalised email, otherwise returns the existing one; concurrency-safe, and a repeated `idempotencyKey` returns the UID the first call produced. A pre-created user is `claimed: false` until a trusted-provider login with a matching verified email attaches an identity — untrusted providers can never claim a UID by asserted email. No client-secret header or body field is accepted on any directory endpoint, in any deployment mode.",
+        "description": "Requires trusted server admission and a current SUPER_ADMIN app-session bearer. Creates the user if no user holds the normalised email, otherwise returns the existing one; concurrency-safe, and a repeated `idempotencyKey` returns the UID the first call produced. A pre-created user is `claimed: false` until a trusted-provider login with a matching verified email attaches an identity \u2014 untrusted providers can never claim a UID by asserted email. No client-secret header or body field is accepted on any directory endpoint, in any deployment mode.",
         "requestBody": {
           "required": true,
           "content": {
             "application/json": {
-              "schema": { "$ref": "#/components/schemas/DirectoryEnsureRequest" }
+              "schema": {
+                "$ref": "#/components/schemas/DirectoryEnsureRequest"
+              }
             }
           }
         },
         "responses": {
           "200": {
-            "description": "The ensured user (minimal fields only — never identities, sessions, codes, or OAuth credentials).",
+            "description": "The ensured user (minimal fields only \u2014 never identities, sessions, codes, or OAuth credentials).",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DirectoryUser" }
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryUser"
+                }
               }
             }
           },
           "400": {
             "description": "Invalid email.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ]
       },
       "get": {
         "operationId": "searchDirectoryUsers",
@@ -199,20 +263,32 @@
             "in": "query",
             "required": false,
             "description": "Literal substring matched against email and displayName.",
-            "schema": { "type": "string", "maxLength": 255 }
+            "schema": {
+              "type": "string",
+              "maxLength": 255
+            }
           },
           {
             "name": "limit",
             "in": "query",
             "required": false,
-            "schema": { "type": "integer", "minimum": 1, "maximum": 100, "default": 25 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
           },
           {
             "name": "cursor",
             "in": "query",
             "required": false,
             "description": "Keyset cursor: the `nextCursor` of the previous page; 0 for the first page.",
-            "schema": { "type": "integer", "minimum": 0, "default": 0 }
+            "schema": {
+              "type": "integer",
+              "minimum": 0,
+              "default": 0
+            }
           }
         ],
         "responses": {
@@ -220,23 +296,39 @@
             "description": "One page of users.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DirectoryPage" }
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryPage"
+                }
               }
             }
           },
           "400": {
             "description": "limit or cursor out of bounds.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           }
-        }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "description": "Requires trusted server admission and a current SUPER_ADMIN app-session bearer. "
       }
     },
     "/api/directory/users/{iUserId}": {
@@ -248,7 +340,10 @@
             "name": "iUserId",
             "in": "path",
             "required": true,
-            "schema": { "type": "integer", "minimum": 1 }
+            "schema": {
+              "type": "integer",
+              "minimum": 1
+            }
           }
         ],
         "responses": {
@@ -256,23 +351,748 @@
             "description": "The user.",
             "content": {
               "application/json": {
-                "schema": { "$ref": "#/components/schemas/DirectoryUser" }
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryUser"
+                }
               }
             }
           },
           "404": {
             "description": "No such user.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
             }
           },
           "403": {
             "description": "Caller's resolved IPv4 peer is not allowlisted.",
             "content": {
-              "application/json": { "schema": { "$ref": "#/components/schemas/Error" } }
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "description": "Requires trusted server admission and a current SUPER_ADMIN app-session bearer. "
+      },
+      "patch": {
+        "summary": "Update user display name (SUPER_ADMIN)",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/DirectoryUser"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 255
+                  }
+                },
+                "required": [
+                  "displayName"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iUserId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/sessions/introspect": {
+      "post": {
+        "summary": "Read current session and tenant authority (trusted server)",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Introspection"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppSession"
+              }
             }
           }
         }
+      }
+    },
+    "/api/sessions/revoke": {
+      "post": {
+        "summary": "Revoke central application session (trusted server)",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "revoked": {
+                      "const": true
+                    }
+                  },
+                  "required": [
+                    "revoked"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/AppSession"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/sessions/select-tenant": {
+      "post": {
+        "summary": "Persist a permitted enabled tenant in the central session",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "selectedTenantId": {
+                      "anyOf": [
+                        {
+                          "type": "integer",
+                          "minimum": 1,
+                          "maximum": 9007199254740991
+                        },
+                        {
+                          "type": "null"
+                        }
+                      ]
+                    }
+                  },
+                  "required": [
+                    "selectedTenantId"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "token": {
+                    "type": "string",
+                    "pattern": "^[0-9a-f]{64}$"
+                  },
+                  "iTenantId": {
+                    "anyOf": [
+                      {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 9007199254740991
+                      },
+                      {
+                        "type": "null"
+                      }
+                    ]
+                  }
+                },
+                "required": [
+                  "token",
+                  "iTenantId"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/runtime/tenants/{iTenantId}": {
+      "get": {
+        "summary": "Read tenant enablement (trusted service only)",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "iTenantId": {
+                      "type": "integer",
+                      "minimum": 1,
+                      "maximum": 9007199254740991
+                    },
+                    "bEnabled": {
+                      "type": "boolean"
+                    }
+                  },
+                  "required": [
+                    "iTenantId",
+                    "bEnabled"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "parameters": [
+          {
+            "name": "iTenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants": {
+      "get": {
+        "summary": "List current actor tenants",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "tenants": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Tenant"
+                      }
+                    }
+                  },
+                  "required": [
+                    "tenants"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ]
+      },
+      "post": {
+        "summary": "Create tenant (SUPER_ADMIN)",
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tenant"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "slug": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                    "maxLength": 100
+                  }
+                },
+                "required": [
+                  "name",
+                  "slug"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants/{iTenantId}": {
+      "patch": {
+        "summary": "Update own tenant; enablement requires SUPER_ADMIN",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Tenant"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "name": {
+                    "type": "string",
+                    "minLength": 1,
+                    "maxLength": 255
+                  },
+                  "slug": {
+                    "type": "string",
+                    "pattern": "^[a-z0-9]+(?:-[a-z0-9]+)*$",
+                    "maxLength": 100
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  }
+                },
+                "required": [],
+                "additionalProperties": false,
+                "minProperties": 1
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iTenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants/{iTenantId}/memberships": {
+      "get": {
+        "summary": "List own tenant memberships (tenant admin)",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "memberships": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/Membership"
+                      }
+                    }
+                  },
+                  "required": [
+                    "memberships"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iTenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants/{iTenantId}/memberships/{iUserId}": {
+      "put": {
+        "summary": "Edit member profile and role; global grants require Super Admin",
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": [
+                      "SUPER_ADMIN",
+                      "TENANT_ADMIN",
+                      "USER"
+                    ]
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  },
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 255
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 255
+                  }
+                },
+                "required": [
+                  "role",
+                  "bEnabled"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iTenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          },
+          {
+            "name": "iUserId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants/{iTenantId}/users": {
+      "post": {
+        "summary": "Add user by email to an administered tenant",
+        "responses": {
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          },
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": [
+                      "SUPER_ADMIN",
+                      "TENANT_ADMIN",
+                      "USER"
+                    ]
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  },
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 255
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 255
+                  }
+                },
+                "required": [
+                  "email",
+                  "displayName",
+                  "role",
+                  "bEnabled"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iTenantId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
       }
     }
   },
@@ -280,7 +1100,10 @@
     "schemas": {
       "TokenRequest": {
         "type": "object",
-        "required": ["code", "redirect_uri"],
+        "required": [
+          "code",
+          "redirect_uri"
+        ],
         "additionalProperties": true,
         "properties": {
           "code": {
@@ -297,30 +1120,63 @@
       },
       "TokenResponse": {
         "type": "object",
-        "required": ["user", "identity", "identities"],
+        "required": [
+          "user",
+          "identity",
+          "identities",
+          "appSession"
+        ],
         "properties": {
           "user": {
             "type": "object",
-            "required": ["iUserId", "email", "displayName", "superAdmin"],
+            "required": [
+              "iUserId",
+              "email",
+              "displayName",
+              "superAdmin"
+            ],
             "properties": {
               "iUserId": {
                 "type": "integer",
                 "description": "The platform-wide person id (id_db.identity_tbl_User.iUserId)."
               },
-              "email": { "type": ["string", "null"] },
-              "displayName": { "type": ["string", "null"] },
+              "email": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "displayName": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
               "superAdmin": {
                 "type": "boolean",
-                "description": "Session-scoped. Provenance: existing SSO Session → AuthCode → redemption; a fresh login writes the same calculated value to both Session and AuthCode. Redemption never recalculates from email."
+                "description": "Session-scoped. Provenance: existing SSO Session \u2192 AuthCode \u2192 redemption; a fresh login writes the same calculated value to both Session and AuthCode. Redemption never recalculates from email."
               }
             }
           },
           "identity": {
             "type": "object",
-            "required": ["provider", "subject"],
+            "required": [
+              "provider",
+              "subject"
+            ],
             "properties": {
-              "provider": { "type": ["string", "null"] },
-              "subject": { "type": ["string", "null"] }
+              "provider": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "subject": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
             },
             "description": "The login method this particular sign-in used."
           },
@@ -328,22 +1184,43 @@
             "type": "array",
             "items": {
               "type": "object",
-              "required": ["provider", "subject", "email"],
+              "required": [
+                "provider",
+                "subject",
+                "email"
+              ],
               "properties": {
-                "provider": { "type": "string" },
-                "subject": { "type": "string" },
-                "email": { "type": ["string", "null"] }
+                "provider": {
+                  "type": "string"
+                },
+                "subject": {
+                  "type": "string"
+                },
+                "email": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                }
               }
             }
+          },
+          "appSession": {
+            "$ref": "#/components/schemas/AppSession"
           }
         }
       },
       "RegistrationRequest": {
         "type": "object",
-        "required": ["webhook_url"],
+        "required": [
+          "webhook_url"
+        ],
         "additionalProperties": true,
         "properties": {
-          "name": { "type": "string", "maxLength": 128 },
+          "name": {
+            "type": "string",
+            "maxLength": 128
+          },
           "webhook_url": {
             "type": "string",
             "format": "uri",
@@ -353,100 +1230,179 @@
       },
       "RegistrationResponse": {
         "type": "object",
-        "required": ["ok", "origin", "events"],
+        "required": [
+          "ok",
+          "origin",
+          "events"
+        ],
         "properties": {
-          "ok": { "const": true },
-          "origin": { "type": "string" },
+          "ok": {
+            "const": true
+          },
+          "origin": {
+            "type": "string"
+          },
           "secret": {
             "type": "string",
             "description": "Legacy webhook-HMAC secret. OPTIONAL to use: POC receivers trust network policy (allowlist id's egress IPv4/CIDRs) plus TLS and are not required to verify signatures."
           },
           "events": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/EventType" }
+            "items": {
+              "$ref": "#/components/schemas/EventType"
+            }
           },
           "signature": {
             "type": "object",
             "description": "Describes the legacy, optional signature scheme.",
             "properties": {
-              "header": { "type": "string" },
-              "scheme": { "type": "string" },
-              "toleranceSeconds": { "type": "integer" },
-              "required": { "const": false }
+              "header": {
+                "type": "string"
+              },
+              "scheme": {
+                "type": "string"
+              },
+              "toleranceSeconds": {
+                "type": "integer"
+              },
+              "required": {
+                "const": false
+              }
             }
           }
         }
       },
       "EventType": {
         "type": "string",
-        "enum": ["ping", "session.revoked", "user.merged", "identity.linked", "identity.unlinked"]
+        "enum": [
+          "ping",
+          "session.revoked",
+          "user.merged",
+          "identity.linked",
+          "identity.unlinked"
+        ]
       },
       "Event": {
         "type": "object",
-        "required": ["id", "type", "occurredAt", "data"],
+        "required": [
+          "id",
+          "type",
+          "occurredAt",
+          "data"
+        ],
         "properties": {
           "id": {
             "type": "integer",
-            "description": "Strictly increasing; the idempotency/replay key. The same id can be delivered more than once — handlers must dedupe on it."
+            "description": "Strictly increasing; the idempotency/replay key. The same id can be delivered more than once \u2014 handlers must dedupe on it."
           },
-          "type": { "$ref": "#/components/schemas/EventType" },
-          "occurredAt": { "type": "string", "format": "date-time" },
-          "data": { "type": "object" }
+          "type": {
+            "$ref": "#/components/schemas/EventType"
+          },
+          "occurredAt": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "data": {
+            "type": "object"
+          }
         }
       },
       "EventsResponse": {
         "type": "object",
-        "required": ["items"],
+        "required": [
+          "items"
+        ],
         "properties": {
           "items": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/Event" },
+            "items": {
+              "$ref": "#/components/schemas/Event"
+            },
             "description": "Oldest first, ordered by id."
           }
         }
       },
       "DirectoryEnsureRequest": {
         "type": "object",
-        "required": ["email"],
+        "required": [
+          "email"
+        ],
         "additionalProperties": true,
         "properties": {
-          "email": { "type": "string", "format": "email", "maxLength": 255 },
-          "displayName": { "type": "string", "maxLength": 255 },
-          "idempotencyKey": { "type": "string", "maxLength": 128 }
+          "email": {
+            "type": "string",
+            "format": "email",
+            "maxLength": 255
+          },
+          "displayName": {
+            "type": "string",
+            "maxLength": 255
+          },
+          "idempotencyKey": {
+            "type": "string",
+            "maxLength": 128
+          }
         }
       },
       "DirectoryUser": {
         "type": "object",
-        "required": ["iUserId", "email", "displayName", "claimed"],
+        "required": [
+          "iUserId",
+          "email",
+          "displayName",
+          "claimed"
+        ],
         "additionalProperties": false,
         "properties": {
-          "iUserId": { "type": "integer" },
-          "email": { "type": ["string", "null"] },
-          "displayName": { "type": ["string", "null"] },
+          "iUserId": {
+            "type": "integer"
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "displayName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
           "claimed": {
             "type": "boolean",
-            "description": "True once any login method is attached — a trusted-provider login with a matching verified email claims a pre-created UID; untrusted providers never can."
+            "description": "True once any login method is attached \u2014 a trusted-provider login with a matching verified email claims a pre-created UID; untrusted providers never can."
           }
         },
         "description": "Deliberately minimal: never identities, sessions, codes, or OAuth credentials."
       },
       "DirectoryPage": {
         "type": "object",
-        "required": ["items", "nextCursor"],
+        "required": [
+          "items",
+          "nextCursor"
+        ],
         "properties": {
           "items": {
             "type": "array",
-            "items": { "$ref": "#/components/schemas/DirectoryUser" }
+            "items": {
+              "$ref": "#/components/schemas/DirectoryUser"
+            }
           },
           "nextCursor": {
-            "type": ["integer", "null"],
+            "type": [
+              "integer",
+              "null"
+            ],
             "description": "Pass as `cursor` for the next page; null when this is the last page."
           }
         }
       },
       "Error": {
         "type": "object",
-        "required": ["error"],
+        "required": [
+          "error"
+        ],
         "properties": {
           "error": {
             "type": "string",
@@ -457,6 +1413,192 @@
             "description": "Present on 403s; matches the server log line carrying the resolved peer IP."
           }
         }
+      },
+      "AppSession": {
+        "type": "object",
+        "required": [
+          "token"
+        ],
+        "properties": {
+          "token": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{64}$"
+          }
+        },
+        "additionalProperties": false
+      },
+      "Tenant": {
+        "type": "object",
+        "properties": {
+          "iTenantId": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "name": {
+            "type": "string"
+          },
+          "slug": {
+            "type": "string"
+          },
+          "bEnabled": {
+            "type": "boolean"
+          },
+          "role": {
+            "enum": [
+              "TENANT_ADMIN",
+              "USER",
+              "SUPER_ADMIN"
+            ]
+          }
+        },
+        "required": [
+          "iTenantId",
+          "name",
+          "slug",
+          "bEnabled",
+          "role"
+        ],
+        "additionalProperties": false
+      },
+      "Introspection": {
+        "oneOf": [
+          {
+            "type": "object",
+            "properties": {
+              "active": {
+                "const": false
+              }
+            },
+            "required": [
+              "active"
+            ],
+            "additionalProperties": false
+          },
+          {
+            "type": "object",
+            "properties": {
+              "active": {
+                "const": true
+              },
+              "user": {
+                "type": "object",
+                "required": [
+                  "iUserId",
+                  "email",
+                  "displayName",
+                  "superAdmin"
+                ],
+                "properties": {
+                  "iUserId": {
+                    "type": "integer",
+                    "description": "The platform-wide person id (id_db.identity_tbl_User.iUserId)."
+                  },
+                  "email": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ]
+                  },
+                  "superAdmin": {
+                    "type": "boolean",
+                    "description": "Session-scoped. Provenance: existing SSO Session \u2192 AuthCode \u2192 redemption; a fresh login writes the same calculated value to both Session and AuthCode. Redemption never recalculates from email."
+                  }
+                }
+              },
+              "tenants": {
+                "type": "array",
+                "items": {
+                  "$ref": "#/components/schemas/Tenant"
+                }
+              },
+              "selectedTenantId": {
+                "anyOf": [
+                  {
+                    "type": "integer",
+                    "minimum": 1,
+                    "maximum": 9007199254740991
+                  },
+                  {
+                    "type": "null"
+                  }
+                ]
+              }
+            },
+            "required": [
+              "active",
+              "user",
+              "tenants",
+              "selectedTenantId"
+            ],
+            "additionalProperties": false
+          }
+        ]
+      },
+      "Membership": {
+        "type": "object",
+        "properties": {
+          "iUserId": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          },
+          "email": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "displayName": {
+            "type": [
+              "string",
+              "null"
+            ]
+          },
+          "role": {
+            "enum": [
+              "SUPER_ADMIN",
+              "TENANT_ADMIN",
+              "USER"
+            ]
+          },
+          "bEnabled": {
+            "type": "boolean"
+          },
+          "claimed": {
+            "type": "boolean"
+          },
+          "superAdmin": {
+            "type": "boolean"
+          },
+          "membershipRole": {
+            "enum": [
+              "TENANT_ADMIN",
+              "USER"
+            ]
+          }
+        },
+        "required": [
+          "iUserId",
+          "email",
+          "displayName",
+          "role",
+          "bEnabled"
+        ],
+        "additionalProperties": false
+      }
+    },
+    "securitySchemes": {
+      "AppSession": {
+        "type": "http",
+        "scheme": "bearer",
+        "description": "Opaque central application session plus trusted server admission"
       }
     }
   }

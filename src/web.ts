@@ -240,6 +240,12 @@ export interface SetupRequest {
    * parentDomain".
    */
   adminDomain?: string;
+  /**
+   * The trusted network, when the claim is the thing that supplies it. Only
+   * set while it is still missing from the store — an instance that already
+   * has one is never asked, and never given the chance to overwrite it here.
+   */
+  trustedCIDR?: string;
   appBaseUrl: string;
   provider: 'google' | 'microsoft';
   clientId: string;

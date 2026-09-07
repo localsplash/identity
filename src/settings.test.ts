@@ -48,7 +48,7 @@ function stubNocoDb(
     if (url.includes('/api/v2/tables/t1/records')) {
       if (method === 'POST' || method === 'PATCH') return json({});
       return json({
-        list: rows.map((r) => ({ ...r, Description: '' })),
+        list: rows.map((r) => ({ Id:r.Id, app:'identity', settingKey:r.Key, settingValue:r.Value, description:'' })),
         pageInfo: { isLastPage: true },
       });
     }
@@ -293,5 +293,36 @@ describe('environment aliases', () => {
         ID_TRUSTED_APP_CIDRS: '192.0.2.0/24',
       })
     ).toEqual({ trustedCIDR: '10.9.0.0/16' });
+  });
+});
+
+describe('PlatformConfig scope contract',()=>{
+  function scoped(rows:unknown[]) {
+    vi.stubGlobal('fetch',vi.fn(async(url:string)=>({ok:true,json:async()=>
+      url.endsWith('/api/v2/meta/bases') ? {list:[{id:'b',title:SETTINGS_BASE_NAME}]} :
+      url.endsWith('/tables') ? {list:[{id:'t',title:SETTINGS_TABLE_NAME}]} :
+      {list:rows,pageInfo:{isLastPage:true}}
+    })));
+  }
+  it('uses exact scope then global, skips blanks and excludes other applications',async()=>{
+    scoped([
+      {Id:1,app:'*',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'},
+      {Id:2,app:'identity',settingKey:'PARENT_DOMAIN',settingValue:''},
+      {Id:3,app:'echo',settingKey:'DB_PASSWORD',settingValue:'echo-only'},
+      {Id:4,app:'*',settingKey:'APP_BASE_URL',settingValue:'https://global.x.tld'},
+      {Id:5,app:'identity',settingKey:'APP_BASE_URL',settingValue:'https://identity.x.tld'},
+    ]);
+    expect(await new SettingsStore(config,{}).getAll()).toEqual({PARENT_DOMAIN:'x.tld',APP_BASE_URL:'https://identity.x.tld'});
+  });
+  it('rejects duplicates even when values match instead of choosing the last row',async()=>{
+    scoped([{Id:1,app:'identity',settingKey:'DB_NAME',settingValue:'platform_db'},{Id:2,app:'identity',settingKey:'DB_NAME',settingValue:'platform_db'}]);
+    await expect(new SettingsStore(config,{}).getAll()).rejects.toMatchObject({reason:'duplicate'});
+  });
+  it('never updates a global row when writing an identity override',async()=>{
+    scoped([{Id:1,app:'*',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'}]);
+    await new SettingsStore(config,{}).set('PARENT_DOMAIN','new.tld');
+    const calls=vi.mocked(fetch).mock.calls;
+    const write=calls.find(([,init])=>init?.method==='POST');
+    expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({app:'identity',settingKey:'PARENT_DOMAIN',settingValue:'new.tld'});
   });
 });

@@ -53,6 +53,16 @@ function resetFakes() {
   fake.events = [];
 }
 
+const ACTOR_TOKEN = 'a'.repeat(64);
+vi.mock('./platform', async (importOriginal) => ({
+  ...await importOriginal<typeof import('./platform')>(),
+  createAppSession: async () => 'b'.repeat(64),
+  getAppSession: async (_db:unknown, token:string) => token === ACTOR_TOKEN ? {
+    sSessionId:ACTOR_TOKEN,iUserId:999,bSuperAdmin:true,sProvider:'google',sSubject:'admin',
+    sAppOrigin:'https://aida.wisp.net',iSelectedTenantId:null,dtCreated:new Date(),
+  } : null,
+}));
+
 vi.mock('./db', () => ({
   getDb: () => ({
     async query() {
@@ -144,6 +154,7 @@ vi.mock('./store', () => {
   const generateId = (bytes = 32) => crypto.randomBytes(bytes).toString('hex');
   return {
     generateId,
+    DirectoryConflictError: class DirectoryConflictError extends Error {},
     getSession: async (_db: unknown, id: string) => fake.sessions.get(id) ?? null,
     createSession: async () => generateId(32),
     touchLastLogin: async () => {},
@@ -230,13 +241,7 @@ vi.mock('./store', () => {
 
 import { buildApp } from './app';
 
-const ENV_KEYS = [
-  'IDENTITY_APP_AUTH_MODE',
-  'IDENTITY_TRUSTED_PROXY_CIDRS',
-  'ID_APP_AUTH_MODE',
-  'ID_TRUSTED_PROXY_CIDRS',
-  'NODE_ENV',
-] as const;
+const ENV_KEYS = ['IDENTITY_APP_AUTH_MODE', 'ID_APP_AUTH_MODE', 'NODE_ENV'] as const;
 
 /**
  * `trustedCIDR` is a setting, not an environment variable — one value for
@@ -272,7 +277,9 @@ function seedSession(params: { iUserId: number; bSuperAdmin: boolean; email: str
   return sSessionId;
 }
 
-// supertest connects over loopback, so 127.0.0.1/32 = "caller is trusted".
+// supertest connects over loopback. That is a private peer, so the app reads
+// X-Forwarded-For on these requests exactly as it would behind a proxy —
+// which is what lets these tests present a client address at all.
 const LOOPBACK = '127.0.0.1/32';
 const ELSEWHERE = '10.9.0.0/16';
 const REDIRECT = 'https://app.wisp.net/auth/callback';
@@ -290,11 +297,7 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
   });
 
   it('allows a peer inside a subnet range', async () => {
-    // Trusted-proxy loopback lets the test present a subnet client address.
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
-    });
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.44.5');
     expect(res.status).toBe(200);
   });
@@ -313,28 +316,31 @@ describe('CIDR trust on /api/token, /api/apps/register, /api/events', () => {
     expect(res.status).toBe(403);
   });
 
-  it('ignores a spoofed X-Forwarded-For when the peer is not a trusted proxy', async () => {
+  /**
+   * The anti-spoof case that matters in production. A proxy appends the peer
+   * it saw (nginx's $proxy_add_x_forwarded_for), so a caller off the internet
+   * claiming to be inside the trusted network still has its own public
+   * address appended after the lie. The right-to-left walk finds that public
+   * hop first and reports it, and the claim buys nothing.
+   */
+  it('reports the public hop a proxy appended, not the private one claimed', async () => {
     const app = makeApp({ trustedCIDR: ELSEWHERE });
-    const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', '10.9.0.5');
+    const res = await request(app)
+      .get('/api/events?since=0')
+      .set('X-Forwarded-For', '10.9.0.5, 203.0.113.9');
     expect(res.status).toBe(403);
   });
 
-  it('rejects IPv6/mapped forms smuggled through a trusted proxy header', async () => {
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: LOOPBACK,
-    });
+  it('rejects IPv6/mapped forms smuggled through a forwarding header', async () => {
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     for (const spoof of ['::ffff:10.9.0.5', '2001:db8::1', 'garbage']) {
       const res = await request(app).get('/api/events?since=0').set('X-Forwarded-For', spoof);
       expect(res.status).toBe(403);
     }
   });
 
-  it('evaluates a reverse-proxy chain only across configured trusted hops', async () => {
-    const app = makeApp({
-      trustedCIDR: ELSEWHERE,
-      IDENTITY_TRUSTED_PROXY_CIDRS: `${LOOPBACK}, 172.16.0.0/24`,
-    });
+  it('evaluates a reverse-proxy chain across private hops only', async () => {
+    const app = makeApp({ trustedCIDR: ELSEWHERE });
     // client 10.9.0.5 → proxy 172.16.0.2 → loopback → id: allowed
     const ok = await request(app)
       .get('/api/events?since=0')
@@ -454,20 +460,20 @@ describe('superAdmin provenance: Session → AuthCode → redemption', () => {
 // ── Directory API ────────────────────────────────────────────────────────────
 
 describe('directory API', () => {
-  it('is CIDR-only: a valid client secret never grants access, in any mode', async () => {
+  it('a server secret without an actor session cannot grant directory access', async () => {
     fake.settings.IDENTITY_CLIENT_SECRET = 's3cret';
     const app = makeApp({ IDENTITY_APP_AUTH_MODE: 'dual', trustedCIDR: ELSEWHERE });
     const res = await request(app)
       .post('/api/directory/users')
       .set('X-Id-Client-Secret', 's3cret')
       .send({ email: 'a@wisp.net', client_secret: 's3cret' });
-    expect(res.status).toBe(403);
+    expect(res.status).toBe(401);
   });
 
   it('ensure is idempotent and returns minimal fields only', async () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const first = await request(app)
-      .post('/api/directory/users')
+      .post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`)
       .send({ email: 'Ada@Wisp.NET', displayName: 'Ada', idempotencyKey: 'k1' });
     expect(first.status).toBe(200);
     expect(first.body).toEqual({
@@ -478,55 +484,55 @@ describe('directory API', () => {
     });
 
     const second = await request(app)
-      .post('/api/directory/users')
+      .post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`)
       .send({ email: 'ada@wisp.net', displayName: 'Ada', idempotencyKey: 'k1' });
     expect(second.body.iUserId).toBe(first.body.iUserId);
   });
 
   it('validates input', async () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
-    expect((await request(app).post('/api/directory/users').send({})).status).toBe(400);
+    expect((await request(app).post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`).send({})).status).toBe(400);
     expect(
-      (await request(app).post('/api/directory/users').send({ email: 'not-an-email' })).status
+      (await request(app).post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`).send({ email: 'not-an-email' })).status
     ).toBe(400);
   });
 
   it('gets a user by iUserId and 404s unknown ids without leaking', async () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const created = await request(app)
-      .post('/api/directory/users')
+      .post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`)
       .send({ email: 'b@wisp.net' });
-    const got = await request(app).get(`/api/directory/users/${created.body.iUserId}`);
+    const got = await request(app).get(`/api/directory/users/${created.body.iUserId}`).set('Authorization', `Bearer ${ACTOR_TOKEN}`);
     expect(got.status).toBe(200);
     expect(got.body).toEqual(created.body);
-    expect((await request(app).get('/api/directory/users/999999')).status).toBe(404);
-    expect((await request(app).get('/api/directory/users/abc')).status).toBe(400);
+    expect((await request(app).get('/api/directory/users/999999').set('Authorization', `Bearer ${ACTOR_TOKEN}`)).status).toBe(404);
+    expect((await request(app).get('/api/directory/users/abc').set('Authorization', `Bearer ${ACTOR_TOKEN}`)).status).toBe(400);
   });
 
   it('searches with bounded pagination and a cursor', async () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     for (let i = 1; i <= 4; i++) {
-      await request(app).post('/api/directory/users').send({ email: `user${i}@wisp.net` });
+      await request(app).post('/api/directory/users').set('Authorization', `Bearer ${ACTOR_TOKEN}`).send({ email: `user${i}@wisp.net` });
     }
-    const page1 = await request(app).get('/api/directory/users?query=user&limit=3');
+    const page1 = await request(app).get('/api/directory/users?query=user&limit=3').set('Authorization', `Bearer ${ACTOR_TOKEN}`);
     expect(page1.status).toBe(200);
     expect(page1.body.items).toHaveLength(3);
     expect(page1.body.nextCursor).toBe(page1.body.items[2].iUserId);
 
     const page2 = await request(app).get(
       `/api/directory/users?query=user&limit=3&cursor=${page1.body.nextCursor}`
-    );
+    ).set('Authorization', `Bearer ${ACTOR_TOKEN}`);
     expect(page2.body.items).toHaveLength(1);
     expect(page2.body.nextCursor).toBeNull();
 
-    expect((await request(app).get('/api/directory/users?limit=0')).status).toBe(400);
-    expect((await request(app).get('/api/directory/users?limit=101')).status).toBe(400);
-    expect((await request(app).get('/api/directory/users?cursor=-1')).status).toBe(400);
+    expect((await request(app).get('/api/directory/users?limit=0').set('Authorization', `Bearer ${ACTOR_TOKEN}`)).status).toBe(400);
+    expect((await request(app).get('/api/directory/users?limit=101').set('Authorization', `Bearer ${ACTOR_TOKEN}`)).status).toBe(400);
+    expect((await request(app).get('/api/directory/users?cursor=-1').set('Authorization', `Bearer ${ACTOR_TOKEN}`)).status).toBe(400);
   });
 
   it('rejects browser-style requests from outside the allowlist', async () => {
     const app = makeApp({ trustedCIDR: ELSEWHERE });
-    const res = await request(app).get('/api/directory/users?query=a');
+    const res = await request(app).get('/api/directory/users?query=a').set('Authorization', `Bearer ${ACTOR_TOKEN}`);
     expect(res.status).toBe(403);
     expect(res.body).toEqual({ error: 'Forbidden', correlationId: expect.any(String) });
   });
@@ -551,8 +557,8 @@ describe('APP_BASE_URL resolution', () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/api/setup/status').set('Host', 'identity.wisp.net');
     expect(res.status).toBe(200);
-    expect(res.body.pinned).toEqual({ appBaseUrl: '', parentDomain: 'wisp.net' });
-    expect(res.body.locked).toEqual({ appBaseUrl: false, parentDomain: false });
+    expect(res.body.pinned).toEqual({ appBaseUrl: '', parentDomain: 'wisp.net', trustedCIDR:LOOPBACK });
+    expect(res.body.locked).toEqual({ appBaseUrl: false, parentDomain: false, trustedCIDR:false });
     expect(res.body.identityHostLabel).toBe('identity');
   });
 

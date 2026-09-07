@@ -1,3 +1,7 @@
+# Consolidated platform foundation
+
+This branch implements the v2 central tenant and application-session contract in [docs/PLATFORM_CONTRACT.md](docs/PLATFORM_CONTRACT.md). It requires `PlatformConfig/cfg_tbl_Setting`; copy legacy settings and preserve the existing Identity database before deployment. The older operational notes below describe the deployed baseline and are superseded where they mention independent app sessions, CIDR-only directory access, or legacy settings names.
+
 # identity — OAuth identity processor & redirector
 
 `identity` is the single sign-in surface for every application under one parent
@@ -71,15 +75,24 @@ Resolution rules, applied deterministically:
 - The **TCP socket peer** is authoritative. Real IPv6 peers are rejected
   (a kernel-reported `::ffff:a.b.c.d` dual-stack peer is normalised to
   IPv4).
-- `X-Forwarded-For` is honoured **only** when the socket peer is inside
-  `IDENTITY_TRUSTED_PROXY_CIDRS`, and only across trusted hops evaluated
-  right-to-left; the first non-proxy hop is the client. Malformed, IPv6,
-  or IPv4-mapped entries in the header are rejected outright — a spoofed
-  header from an untrusted peer changes nothing.
+- `X-Forwarded-For` is honoured **only** when the socket peer is a private
+  address (RFC1918, loopback, link-local), and only across private hops
+  evaluated right-to-left; the first public hop is the client. Malformed,
+  IPv6, or IPv4-mapped entries in the header are rejected outright.
+  **There is nothing to configure.** A reverse proxy in front of this app
+  reaches it over a private network by construction, while a caller
+  arriving straight off the internet presents a public peer and never has
+  its header believed — so the rule that decides whether to read the
+  header is the socket peer, which cannot be forged over TCP.
 - Denials are a generic `403 { "error": "Forbidden", "correlationId" }`;
   the log line carrying that correlation id records the resolved peer IP.
-- In production, startup **fails** when `IDENTITY_APP_AUTH_MODE` needs CIDRs and
-  `trustedCIDR` is empty, and when any CIDR entry is malformed.
+- Startup **fails** whenever any CIDR entry is malformed, and — in
+  production, once the instance is claimed — when `IDENTITY_APP_AUTH_MODE`
+  needs CIDRs and `trustedCIDR` is empty. An *unclaimed* instance starts with
+  a warning instead: every setting is empty on a fresh install, and dying
+  here would make the wizard that fills them in unreachable. Nothing is
+  admitted in the meantime — an empty `trustedCIDR` denies every caller to
+  the server-only endpoints.
 
 `IDENTITY_APP_AUTH_MODE` is the rollout flag: `cidr` (POC default), `secret`
 (legacy `IDENTITY_CLIENT_SECRET` only), or `dual` (either accepted) for the
@@ -92,6 +105,14 @@ no client-secret header or body field is ever accepted there.
 > That is accepted for the first-party POC on the controlled
 > LSAidaOffice01 host, and is **not** suitable for unrelated or
 > customer-hosted X.TLD applications.
+>
+> Trusting private peers to speak for a client has a matching edge: a
+> process **already inside** one of this app's private networks can forge
+> a hop and present any client address it likes. Callers off the internet
+> cannot (their real address is appended after the forgery, and the walk
+> reports that one), and a proxy that replaces rather than appends the
+> header is equally safe. Treat the private networks this container joins
+> as inside the trust boundary, because they are.
 
 Enforce the same policy at the edge as well as in the app. NGINX, with
 apps at `203.0.113.7` and an internal `10.9.0.0/16`:
@@ -112,9 +133,10 @@ location / {
 }
 ```
 
-When NGINX fronts the app like this, put the NGINX host's IP in
-`IDENTITY_TRUSTED_PROXY_CIDRS` so the app evaluates the forwarded client
-address; the application-layer check then re-applies the same allowlist.
+`$proxy_add_x_forwarded_for` is the part that matters: it appends the
+address NGINX saw, which is what makes the app's right-to-left walk
+immune to a forged hop. NGINX reaches the app over a private network, so
+the app reads that header with nothing configured on either side.
 Firewall prerequisite: only the reverse proxy (and, on the controlled
 host, the app servers) may reach the app port at all — the allowlist is
 defence in depth, not the only wall.
@@ -165,42 +187,57 @@ ends only when the user signs out, signs out everywhere, or a Super System
 Admin revokes their sessions. Applications are expected to follow the same
 model for their own local sessions.
 
-**UISP bridge.** The ISP-portal plugin (see EchoOrchestrator/uisp-plugin)
+**UISP bridge.** The ISP-portal plugin (shipped separately)
 verifies the subscriber's portal session and redirects to
 `/sso/callback?code&sig` with an HMAC-signed one-time payload. `identity` verifies
 the signature and nonce, records a `uisp` identity (subject = CRM clientId),
 and completes the pending app redirect — or `DEFAULT_REDIRECT_URI` when the
 user entered straight from the portal.
 
+## Installing
+
+```bash
+scripts/install.sh      # generates the DB passwords, brings everything up
+```
+
+Then open the service in a browser and follow `/setup`. That is the whole
+installation: nothing else is edited by hand.
+
+Identity owns its data. `docker-compose.yml` brings up its own MySQL on a
+private network — not published, not shared — and this app applies its own
+schema to it. The only thing it expects to already exist is a NocoDB.
+
 ## Configuration
 
 **Zero-config is the intended path.** A fresh instance is expected at
-`identity.X.TLD` and works out of the box. The `.env` carries two things and
-nothing else (see `.env.example`):
+`identity.X.TLD` and asks for what it needs in the browser.
 
-| Variable | Why it cannot live in the settings table |
-| --- | --- |
-| `NOCODB_BASE_URL` | Where the settings table is |
-| `NOCODB_API_TOKEN` | How to read it |
+Three things cannot be answered by the settings table, because they are how
+the settings table is reached or how the app is admitted to at all. The
+first-run wizard collects them:
 
-Everything else — the MySQL coordinates, the trusted network, the public
-URL, the OAuth credentials — is a row in the **`auth_tbl_Settings`** table of
-the **`IdentityBase`** base in NocoDB at `nocodb.X.TLD`.
+| Collected in step 1 | Saved to | Why not a settings row |
+| --- | --- | --- |
+| NocoDB URL | `/data/config.json` | It is where the settings are |
+| NocoDB API token | `/data/config.json` | It is how they are read |
+| `trustedCIDR` | `auth_tbl_Settings` | Required before anything is admitted; the row itself is platform-wide, so it goes to the store like every other setting |
+
+`/data` is the `identity-config` volume, so an instance is set up once and
+survives rebuilds. Both NocoDB values may instead be stated in `.env`, where
+they win and the wizard skips step 1.
+
+Everything else — the trusted network, the public URL, the OAuth
+credentials — is a row in the **`auth_tbl_Settings`** table of the
+**`IdentityBase`** base in NocoDB at `nocodb.X.TLD`. The MySQL coordinates
+come from `docker-compose.yml` and are not asked about at all.
 
 ### Naming
 
-| Thing | Here |
-| --- | --- |
-| Public URL | `identity.X.TLD` — lowercase repo name under the parent domain |
-| NocoDB base | `IdentityBase` |
-| Settings table | `auth_tbl_Settings` |
-
-`IdentityBase` is the only NocoDB base on the platform. The Echo applications
-keep their settings in the Echo database (`echo_tbl_Settings`), next to the
-data they describe; the one thing they read from here is `trustedCIDR`, which
-identity and every application have to agree on and which therefore has to
-live somewhere all of them can reach. A second base would be named for
-whatever it holds — and only if something genuinely needed one.
+| Thing | Rule | Here |
+| --- | --- | --- |
+| Public URL | `{repo}.X.TLD`, lowercase | `identity.X.TLD` |
+| NocoDB base | `{Repo}Base` | `IdentityBase` |
+| Settings table | `auth_tbl_Settings` | `auth_tbl_Settings` |
 
 The short form `id` is retired: it reads as "identifier" everywhere it
 appears, which is genuinely ambiguous in an application whose primary key is
@@ -246,7 +283,7 @@ base named `IdentityBase` exists:
 | Key | Purpose |
 | --- | --- |
 | `DB_HOST` / `DB_PORT` / `DB_USER` / `DB_PASSWORD` / `DB_NAME` | The MySQL database this app owns and migrates itself. Collected by the first-run wizard; a change takes a restart |
-| `trustedCIDR` | **One value for the whole platform** — the network the servers sit on. Identity and every Echo application read this same key rather than spelling the same network under its own name; it is the only row the Echo apps read from this base |
+| `trustedCIDR` | **One value for the whole platform** — the network the servers sit on. Every application reads this same key rather than spelling the same network under its own name |
 | `PARENT_DOMAIN` | Apex domain (`X.TLD`) the **apps** are served from; drives the cookie scope and redirect allowlist, and is the default super-admin domain |
 | `APP_BASE_URL` | Public base URL, e.g. `https://identity.X.TLD`. Normally left to the wizard — see *Where this service thinks it lives* below |
 | `IDENTITY_CLIENT_SECRET` | **Legacy (rollout only)** — shared secret apps present at `/api/token` when `IDENTITY_APP_AUTH_MODE` is `secret`/`dual`; ignored in the default `cidr` mode |
@@ -296,15 +333,28 @@ its own label, so `identity.wisp.net` proposes `wisp.net`.
 
 While no OAuth provider is configured, the instance is **unclaimed**: `/`
 redirects to `/setup`, a built-in wizard that walks the first admin through
-claiming it:
+claiming it.
 
-1. If the identity database is not set yet, the wizard asks for it first —
-   host, port, user, password, database — tests the connection before
-   saving anything, writes the coordinates to `auth_tbl_Settings`, and
-   applies the schema. Nobody has to hand-edit a row in NocoDB to get an
-   instance started. (The settings store itself is not diagnosed here: if
-   NocoDB were unreachable the whole app would be answering `503` with the
-   retry page instead.)
+> **The wizard is open to whoever reaches it.** Whoever completes it becomes
+> Super System Admin, and it closes for good the moment one provider is
+> configured. The page says so. On a service reachable from the internet,
+> the gap between "it answers" and "it is claimed" is a gap someone else can
+> step into — finish the wizard immediately, then confirm on `/admin` that
+> the only Super System Admin is you.
+
+1. **Step 1, before this app knows anything about itself:** the NocoDB URL,
+   an API token, and the trusted network. The address is proved before it is
+   saved — the base is found or created, and the settings table with it — so
+   a typo is a message on the page rather than a restart loop to read logs
+   over. `trustedCIDR` is required here on purpose: it is the one security
+   decision that cannot wait for a later screen, because the endpoints it
+   guards exist the moment the process listens. The NocoDB coordinates are
+   written to `/data/config.json`, `trustedCIDR` goes to the settings table
+   where every application reads it, and the service restarts into them.
+   Skipped entirely when `.env` already states the NocoDB values.
+
+   There is no step for the identity database. It is the MySQL in
+   `docker-compose.yml`, and the app migrates it itself.
 2. The wizard fills in this service's public URL from the browser's own
    address bar and the application domain from that host minus its label
    (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
@@ -329,6 +379,10 @@ claiming it:
 
 The wizard closes permanently the moment any provider is configured; later
 changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
+
+To start over, remove the `identity-config` volume (the app forgets where
+its settings are and step 1 returns) and clear the provider rows in
+`auth_tbl_Settings` (the instance becomes unclaimed again).
 
 ## Super System Admin
 
@@ -387,7 +441,7 @@ Apps therefore implement one endpoint. There is no polling and no cron.
 POST /api/apps/register
 Content-Type: application/json
 
-{ "name": "EchoWeb",
+{ "name": "ExampleApp",
   "webhook_url": "https://app.X.TLD/id/events" }
 ```
 
@@ -440,7 +494,7 @@ shown in the dashboard.
 | `ping` | `{ origin }` | Nothing; answer 2xx |
 | `session.revoked` | `{ iUserId, scope: 'all' \| 'one', sessionId? }` | End its own sessions for that id user |
 | `user.merged` | `{ fromUserId, toUserId }` | Repoint its local mapping from `fromUserId` to `toUserId`, end sessions for the retired user |
-| `identity.linked` / `identity.unlinked` | `{ iUserId, provider, subject }` | Usually nothing; apps that bind on a specific identity (EchoWeb binds an org by UISP `clientId`) may care |
+| `identity.linked` / `identity.unlinked` | `{ iUserId, provider, subject }` | Usually nothing; apps that bind on a specific identity (one binding an org by UISP `clientId`, say) may care |
 
 ### 3. Catch up at boot
 
@@ -576,5 +630,5 @@ npm test        # vitest
 npm run build   # tsc → dist/
 ```
 
-The full stack (MySQL, NocoDB, this app, the Echo apps) is composed in
-**EchoOrchestrator**.
+`docker-compose.yml` brings up this app and everything it owns. The only
+thing it expects to already exist is NocoDB.

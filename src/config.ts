@@ -9,8 +9,8 @@ import { z } from 'zod';
  *   NOCODB_API_TOKEN    how to read them
  *
  * Everything else — the MySQL coordinates, the trusted network, the public
- * URL, provider credentials — is a row in the `auth_tbl_Settings` table of
- * the `IdentityBase` base (see settings.ts). The base and table are named by
+ * URL, provider credentials — is a row in the `cfg_tbl_Setting` table of
+ * the `PlatformConfig` base (see settings.ts). The base and table are named by
  * convention, not configured, and the base ID is detected from that name at
  * runtime; a base ID in a config file is exactly the coupling the convention
  * exists to remove.
@@ -41,18 +41,17 @@ const envSchema = z.object({
   //   dual   — either is accepted (rollout/migration window)
   //
   // The network itself is NOT here: `trustedCIDR` is one setting for the
-  // whole platform, read from IdentityBase → auth_tbl_Settings so every
+  // whole platform, read from PlatformConfig → cfg_tbl_Setting so every
   // application spells the same network the same way. The environment may
   // still pin it as IDENTITY_TRUSTED_NETWORK (see ENV_ALIASES).
+  //
+  // Which peers may speak for a client is not configured either: net.ts
+  // reads X-Forwarded-For from private peers only, so a reverse proxy in
+  // front of this app works with nothing stated and a caller off the
+  // internet cannot talk its way into the trusted network.
   IDENTITY_APP_AUTH_MODE: z.enum(['cidr', 'secret', 'dual']).default('cidr'),
   /** @deprecated Pre-rollout name for IDENTITY_APP_AUTH_MODE; still honoured. */
   ID_APP_AUTH_MODE: z.enum(['cidr', 'secret', 'dual']).optional(),
-  // Comma-separated IPv4 CIDRs of reverse proxies directly connected to this
-  // app. X-Forwarded-For is honoured only when the socket peer is in here.
-  // Empty (the default) means applications reach this service directly.
-  IDENTITY_TRUSTED_PROXY_CIDRS: z.string().default(''),
-  /** @deprecated Pre-rollout name; still honoured. */
-  ID_TRUSTED_PROXY_CIDRS: z.string().default(''),
 
   // NocoDB — the settings store. The instance lives at
   // nocodb.<parent-domain>; the API token is generated in the NocoDB UI
@@ -75,7 +74,5 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): AppConfig {
       env.IDENTITY_APP_AUTH_MODE || !config.ID_APP_AUTH_MODE
         ? config.IDENTITY_APP_AUTH_MODE
         : config.ID_APP_AUTH_MODE,
-    IDENTITY_TRUSTED_PROXY_CIDRS:
-      config.IDENTITY_TRUSTED_PROXY_CIDRS || config.ID_TRUSTED_PROXY_CIDRS,
   };
 }

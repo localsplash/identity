@@ -1,4 +1,4 @@
-import mysql from 'mysql2/promise';
+import mysql from "mysql2/promise";
 
 /**
  * id_db schema migrations — this repository is the sole schema owner.
@@ -162,13 +162,85 @@ async function directoryIdempotency(conn: mysql.PoolConnection): Promise<void> {
   `);
 }
 
+/** Platform authority extends the existing populated Identity tables additively. */
+async function platformDirectory(conn: mysql.PoolConnection): Promise<void> {
+  await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_Tenant (
+    iTenantId BIGINT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(100) NOT NULL,
+    bEnabled TINYINT(1) NOT NULL DEFAULT 1,
+    dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_tenant_slug (slug)
+  ) ENGINE=InnoDB`);
+  await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_Membership (
+    iTenantId BIGINT NOT NULL,
+    iUserId BIGINT NOT NULL,
+    role ENUM('TENANT_ADMIN','USER') NOT NULL DEFAULT 'USER',
+    bEnabled TINYINT(1) NOT NULL DEFAULT 1,
+    dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (iTenantId, iUserId),
+    INDEX idx_membership_user (iUserId),
+    FOREIGN KEY (iTenantId) REFERENCES identity_tbl_Tenant(iTenantId),
+    FOREIGN KEY (iUserId) REFERENCES identity_tbl_User(iUserId)
+  ) ENGINE=InnoDB`);
+  await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_LegacyMap (
+    sSource VARCHAR(64) NOT NULL,
+    sEntity ENUM('USER','TENANT') NOT NULL,
+    sLegacyId VARCHAR(128) NOT NULL,
+    iUserId BIGINT NULL,
+    iTenantId BIGINT NULL,
+    dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    PRIMARY KEY (sSource, sEntity, sLegacyId),
+    FOREIGN KEY (iUserId) REFERENCES identity_tbl_User(iUserId),
+    FOREIGN KEY (iTenantId) REFERENCES identity_tbl_Tenant(iTenantId),
+    CHECK ((sEntity = 'USER' AND iUserId IS NOT NULL AND iTenantId IS NULL)
+      OR (sEntity = 'TENANT' AND iTenantId IS NOT NULL AND iUserId IS NULL))
+  ) ENGINE=InnoDB`);
+  await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_Audit (
+    iAuditId BIGINT AUTO_INCREMENT PRIMARY KEY,
+    iActorUserId BIGINT NOT NULL,
+    iTenantId BIGINT NULL,
+    action VARCHAR(64) NOT NULL,
+    jDetail JSON NOT NULL,
+    dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3)
+  ) ENGINE=InnoDB`);
+  const [columns] = await conn.query<
+    mysql.RowDataPacket[]
+  >(`SELECT COLUMN_NAME FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'identity_tbl_Session' AND column_name = 'sAppOrigin'`);
+  if (!columns.length)
+    await conn.query(
+      `ALTER TABLE identity_tbl_Session ADD COLUMN sAppOrigin VARCHAR(255) NULL`,
+    );
+  const [selectionColumns] = await conn.query<
+    mysql.RowDataPacket[]
+  >(`SELECT COLUMN_NAME FROM information_schema.columns
+    WHERE table_schema = DATABASE() AND table_name = 'identity_tbl_Session' AND column_name = 'iSelectedTenantId'`);
+  if (!selectionColumns.length)
+    await conn.query(`ALTER TABLE identity_tbl_Session ADD COLUMN iSelectedTenantId BIGINT NULL,
+    ADD CONSTRAINT fk_session_tenant FOREIGN KEY (iSelectedTenantId) REFERENCES identity_tbl_Tenant(iTenantId)`);
+}
+
+async function userRoleOverride(conn: mysql.PoolConnection): Promise<void> {
+  const [rows] = await conn.query<
+    mysql.RowDataPacket[]
+  >(`SELECT COLUMN_NAME FROM information_schema.columns
+    WHERE table_schema=DATABASE() AND table_name='identity_tbl_User' AND column_name='bSuperAdminOverride'`);
+  if (!rows.length)
+    await conn.query(
+      `ALTER TABLE identity_tbl_User ADD COLUMN bSuperAdminOverride TINYINT(1) NULL DEFAULT NULL`,
+    );
+}
+
 /** Ordered, append-only. Never rename or reorder an entry once released. */
 export const MIGRATIONS: Migration[] = [
-  { name: '0001_baseline', run: baseline },
-  { name: '0002_directory_idempotency', run: directoryIdempotency },
+  { name: "0001_baseline", run: baseline },
+  { name: "0002_directory_idempotency", run: directoryIdempotency },
+  { name: "0003_platform_directory_sessions", run: platformDirectory },
+  { name: "0004_user_role_override", run: userRoleOverride },
 ];
 
-const MIGRATION_LOCK = 'identity_db_migrations';
+const MIGRATION_LOCK = "identity_db_migrations";
 
 /**
  * Tables this repository owned under its pre-rollout `id_` prefix.
@@ -182,29 +254,34 @@ const MIGRATION_LOCK = 'identity_db_migrations';
  * keys and the rows themselves across.
  */
 const LEGACY_TABLE_NAMES = [
-  'Migration',
-  'User',
-  'Identity',
-  'Session',
-  'AuthCode',
-  'App',
-  'Event',
-  'Delivery',
-  'SsoNonce',
-  'DirectoryKey',
+  "Migration",
+  "User",
+  "Identity",
+  "Session",
+  "AuthCode",
+  "App",
+  "Event",
+  "Delivery",
+  "SsoNonce",
+  "DirectoryKey",
 ];
 
-async function tableExists(conn: mysql.PoolConnection, name: string): Promise<boolean> {
+async function tableExists(
+  conn: mysql.PoolConnection,
+  name: string,
+): Promise<boolean> {
   const [rows] = await conn.query<mysql.RowDataPacket[]>(
     `SELECT COUNT(*) AS n FROM information_schema.tables
       WHERE table_schema = DATABASE() AND table_name = ?`,
-    [name]
+    [name],
   );
   return Number(rows[0]?.n) > 0;
 }
 
 /** Adopt a pre-rollout `id_tbl_*` database under the `identity_tbl_*` names. */
-export async function adoptLegacyTableNames(conn: mysql.PoolConnection): Promise<string[]> {
+export async function adoptLegacyTableNames(
+  conn: mysql.PoolConnection,
+): Promise<string[]> {
   const renamed: string[] = [];
   for (const suffix of LEGACY_TABLE_NAMES) {
     const from = `id_tbl_${suffix}`;
@@ -228,10 +305,10 @@ export async function runMigrations(pool: mysql.Pool): Promise<string[]> {
   try {
     const [lockRows] = await conn.query<mysql.RowDataPacket[]>(
       `SELECT GET_LOCK(?, 60) AS locked`,
-      [MIGRATION_LOCK]
+      [MIGRATION_LOCK],
     );
     if (Number(lockRows[0]?.locked) !== 1) {
-      throw new Error('Could not acquire the id_db migration lock');
+      throw new Error("Could not acquire the id_db migration lock");
     }
     try {
       // Before anything reads or writes the history: adopt a database that
@@ -247,13 +324,16 @@ export async function runMigrations(pool: mysql.Pool): Promise<string[]> {
         ) ENGINE=InnoDB
       `);
       const [rows] = await conn.query<mysql.RowDataPacket[]>(
-        `SELECT sName FROM identity_tbl_Migration`
+        `SELECT sName FROM identity_tbl_Migration`,
       );
       const done = new Set(rows.map((r) => r.sName as string));
       for (const migration of MIGRATIONS) {
         if (done.has(migration.name)) continue;
         await migration.run(conn);
-        await conn.query(`INSERT INTO identity_tbl_Migration (sName) VALUES (?)`, [migration.name]);
+        await conn.query(
+          `INSERT INTO identity_tbl_Migration (sName) VALUES (?)`,
+          [migration.name],
+        );
         applied.push(migration.name);
       }
     } finally {
