@@ -20,6 +20,7 @@ All following APIs require trusted server admission, using the existing `IDENTIT
   "active": true,
   "user": {"iUserId": 7, "email": "person@X.TLD", "displayName": "Person", "superAdmin": false},
   "tenants": [{"iTenantId": 12, "name": "Office", "slug": "office", "role": "TENANT_ADMIN", "bEnabled": true}],
+  "numbers": [{"iPhoneNumberId":1,"iTenantId":12,"phoneNumber":"+17145550100","label":"Reception","bVoice":true,"bMessaging":true,"bEnabled":true,"accessPolicy":"TENANT_MEMBERS","iVersion":1}],
   "selectedTenantId": 12
 }
 ```
@@ -65,3 +66,11 @@ For legacy Echo/Aida IDs, create reviewed records such as `{ "source":"echo", "e
 The server admission requirement on global directory routes is intentionally tightened in contract v2; existing CIDR-only consumers must add the central actor bearer. The existing OpenAPI breaking-change CI gate will report this intentional API change for coordinated rollout review.
 
 `docker build --target test -t identity-platform:test .` uses Node 22 and executes the unit/contract suite. Real MySQL tests require `TEST_DB_URL` pointed at a disposable MySQL container: the migration suite recreates the database in that URL and the platform suite recreates `identity_platform_test`. They exercise migration idempotency, preserved users, multi-tenant isolation, credential hashing/type separation, central selection, enablement, revoke-all, membership concurrency and audit writes. Never use a live database URL.
+
+## Shared tenant numbers
+
+Migration `0005_shared_phone_numbers` adds `identity_tbl_PhoneNumber` in `platform_db`. Every number supports voice and messaging, belongs to one immutable tenant, and explicitly grants `TENANT_MEMBERS` access. Active introspection includes enabled numbers for enabled tenant memberships; Super Admins see all enabled tenants’ numbers. No Echo-local user or organization row is needed to grant access.
+
+AidaAdmin manages the registry through actor-authorized `GET/POST /api/directory/tenants/:id/numbers` and `PUT /api/directory/tenants/:id/numbers/:numberId`. GET returns `{numbers:[...]}`; writes return the number record. POST takes `phoneNumber,label,bEnabled,accessPolicy` (both capability flags default true). PUT additionally requires `expectedVersion`. Phone number and tenant cannot be changed; duplicate ownership or stale edits return 409. Only Super Admins or that tenant’s enabled Tenant Admins can write. Ordinary members only consume numbers through introspection. Echo currently requires +1 ten-digit numbers.
+
+Deploy Identity before consumers that require the `numbers` session field. Backfill only reviewed E.164/tenant assignments using `IMPORT_ACTOR_USER_ID=... PLATFORM_DB_URL=... node scripts/import-phone-numbers.mjs manifest.json` (dry run); append `--apply` to commit. Entries contain `iTenantId`, `phoneNumber`, and `label`. Conflicting ownership aborts the transaction; existing assignments are never overwritten or re-enabled. Preserve legacy Echo rows as history/provenance. Adding a number does not provision a carrier or DID route. Disabling access revokes Echo access on the next request; existing PBX routes must be disabled separately in DID routes.

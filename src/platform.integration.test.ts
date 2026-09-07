@@ -78,6 +78,93 @@ describe.skipIf(!url)("platform authority (isolated MySQL)", () => {
       .post("/api/sessions/introspect")
       .set("X-Test-Server", "trusted")
       .send({ token });
+  it("shares numbers with all members and enforces tenant ownership and edit versions", async () => {
+    const input = {
+      phoneNumber: "+17145550100",
+      label: "Reception",
+      bEnabled: true,
+      accessPolicy: "TENANT_MEMBERS",
+    };
+    const endpoint = `/api/directory/tenants/${tenantA}/numbers`;
+    const created = await request(app)
+      .post(endpoint)
+      .set(auth(aliceToken))
+      .send(input);
+    expect(created.status).toBe(201);
+    expect(created.body).toMatchObject({
+      ...input,
+      bVoice: true,
+      bMessaging: true,
+      iTenantId: tenantA,
+      iVersion: 1,
+    });
+    const id = created.body.iPhoneNumberId;
+    expect((await introspect(aliceToken)).body.numbers).toHaveLength(1);
+    expect((await introspect(bobToken)).body.numbers).toEqual([]);
+    expect((await introspect(rootToken)).body.numbers).toHaveLength(1);
+    expect((await request(app).get(endpoint).set(auth(bobToken))).status).toBe(
+      403,
+    );
+    expect(
+      (
+        await request(app)
+          .post(`/api/directory/tenants/${tenantB}/numbers`)
+          .set(auth(bobToken))
+          .send(input)
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await request(app)
+          .put(`${endpoint}/${id}`)
+          .set(auth(aliceToken))
+          .send({ ...input, expectedVersion: 9 })
+      ).status,
+    ).toBe(409);
+    expect(
+      (
+        await request(app)
+          .put(`${endpoint}/${id}`)
+          .set(auth(aliceToken))
+          .send({ ...input, phoneNumber: "+17145550101", expectedVersion: 1 })
+      ).status,
+    ).toBe(409);
+    const user = await store.createUser(pool, "member@x.tld", "Member");
+    const root = (await p.getAppSession(pool, rootToken))!;
+    await p.setMembership(pool, root, tenantA, user, "USER", true);
+    const memberToken = await p.createAppSession(
+      pool,
+      {
+        iUserId: user,
+        bSuperAdmin: false,
+        sProvider: "google",
+        sSubject: String(user),
+      },
+      "https://echo.X.TLD",
+    );
+    expect((await introspect(memberToken)).body.numbers).toHaveLength(1);
+    expect(
+      (
+        await request(app)
+          .post(endpoint)
+          .set(auth(memberToken))
+          .send({ ...input, phoneNumber: "+17145550102" })
+      ).status,
+    ).toBe(403);
+    expect(
+      (
+        await request(app)
+          .put(`${endpoint}/${id}`)
+          .set(auth(aliceToken))
+          .send({ ...input, bEnabled: false, expectedVersion: 1 })
+      ).status,
+    ).toBe(200);
+    expect((await introspect(memberToken)).body.numbers).toEqual([]);
+    await pool.query(
+      "DELETE FROM identity_tbl_PhoneNumber WHERE iPhoneNumberId=?",
+      [id],
+    );
+  });
   it("requires server admission plus actor authority for directory requests", async () => {
     expect(
       (

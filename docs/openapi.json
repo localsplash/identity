@@ -1094,6 +1094,240 @@
           }
         ]
       }
+    },
+    "/api/directory/tenants/{iTenantId}/numbers": {
+      "parameters": [
+        {
+          "name": "iTenantId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        }
+      ],
+      "get": {
+        "summary": "List tenant numbers (tenant administrator)",
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "numbers": {
+                      "type": "array",
+                      "items": {
+                        "$ref": "#/components/schemas/PhoneNumber"
+                      }
+                    }
+                  },
+                  "required": [
+                    "numbers"
+                  ],
+                  "additionalProperties": false
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid number or request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized tenant administrator"
+          },
+          "409": {
+            "description": "Number already assigned, immutable number changed, or stale version"
+          }
+        }
+      },
+      "post": {
+        "summary": "Assign a voice and messaging number to a tenant",
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "responses": {
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PhoneNumber"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid number or request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized tenant administrator"
+          },
+          "409": {
+            "description": "Number already assigned, immutable number changed, or stale version"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "phoneNumber": {
+                    "type": "string",
+                    "pattern": "^\\+1[2-9]\\d{9}$"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "bVoice": {
+                    "type": "boolean",
+                    "const": true
+                  },
+                  "bMessaging": {
+                    "type": "boolean",
+                    "const": true
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  },
+                  "accessPolicy": {
+                    "type": "string",
+                    "enum": [
+                      "TENANT_MEMBERS"
+                    ]
+                  }
+                },
+                "required": [
+                  "phoneNumber",
+                  "bEnabled",
+                  "accessPolicy"
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/directory/tenants/{iTenantId}/numbers/{numberId}": {
+      "parameters": [
+        {
+          "name": "iTenantId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1,
+            "maximum": 9007199254740991
+          }
+        },
+        {
+          "name": "numberId",
+          "in": "path",
+          "required": true,
+          "schema": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      ],
+      "put": {
+        "summary": "Edit an immutable tenant number with version checking",
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/PhoneNumber"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid number or request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized tenant administrator"
+          },
+          "409": {
+            "description": "Number already assigned, immutable number changed, or stale version"
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                  "phoneNumber": {
+                    "type": "string",
+                    "pattern": "^\\+1[2-9]\\d{9}$"
+                  },
+                  "label": {
+                    "type": "string"
+                  },
+                  "bVoice": {
+                    "type": "boolean",
+                    "const": true
+                  },
+                  "bMessaging": {
+                    "type": "boolean",
+                    "const": true
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  },
+                  "accessPolicy": {
+                    "type": "string",
+                    "enum": [
+                      "TENANT_MEMBERS"
+                    ]
+                  },
+                  "expectedVersion": {
+                    "type": "integer",
+                    "minimum": 1
+                  }
+                },
+                "required": [
+                  "phoneNumber",
+                  "bEnabled",
+                  "accessPolicy",
+                  "expectedVersion"
+                ]
+              }
+            }
+          }
+        }
+      }
     }
   },
   "components": {
@@ -1529,13 +1763,70 @@
                     "type": "null"
                   }
                 ]
+              },
+              "numbers": {
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "properties": {
+                    "iPhoneNumberId": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "iTenantId": {
+                      "type": "integer",
+                      "minimum": 1
+                    },
+                    "phoneNumber": {
+                      "type": "string",
+                      "pattern": "^\\+1[2-9]\\d{9}$"
+                    },
+                    "label": {
+                      "type": "string"
+                    },
+                    "bVoice": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "bMessaging": {
+                      "type": "boolean",
+                      "const": true
+                    },
+                    "bEnabled": {
+                      "type": "boolean"
+                    },
+                    "accessPolicy": {
+                      "type": "string",
+                      "enum": [
+                        "TENANT_MEMBERS"
+                      ]
+                    },
+                    "iVersion": {
+                      "type": "integer",
+                      "minimum": 1
+                    }
+                  },
+                  "required": [
+                    "iPhoneNumberId",
+                    "iTenantId",
+                    "phoneNumber",
+                    "label",
+                    "bVoice",
+                    "bMessaging",
+                    "bEnabled",
+                    "accessPolicy",
+                    "iVersion"
+                  ]
+                }
               }
             },
             "required": [
               "active",
               "user",
               "tenants",
-              "selectedTenantId"
+              "selectedTenantId",
+              "numbers"
             ],
             "additionalProperties": false
           }
@@ -1592,6 +1883,59 @@
           "bEnabled"
         ],
         "additionalProperties": false
+      },
+      "PhoneNumber": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "iPhoneNumberId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "iTenantId": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "phoneNumber": {
+            "type": "string",
+            "pattern": "^\\+1[2-9]\\d{9}$"
+          },
+          "label": {
+            "type": "string"
+          },
+          "bVoice": {
+            "type": "boolean",
+            "const": true
+          },
+          "bMessaging": {
+            "type": "boolean",
+            "const": true
+          },
+          "bEnabled": {
+            "type": "boolean"
+          },
+          "accessPolicy": {
+            "type": "string",
+            "enum": [
+              "TENANT_MEMBERS"
+            ]
+          },
+          "iVersion": {
+            "type": "integer",
+            "minimum": 1
+          }
+        },
+        "required": [
+          "iPhoneNumberId",
+          "iTenantId",
+          "phoneNumber",
+          "label",
+          "bVoice",
+          "bMessaging",
+          "bEnabled",
+          "accessPolicy",
+          "iVersion"
+        ]
       }
     },
     "securitySchemes": {
