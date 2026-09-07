@@ -3,7 +3,7 @@
   "info": {
     "title": "Platform Identity \u2014 X.TLD application integration contract",
     "version": "2.0.0",
-    "description": "Identity is the sole platform authority for users, provider identities, tenants, memberships, and SSO/application browser sessions. Trusted server admission uses trustedCIDR (default) or configured secret/dual compatibility mode. Directory operations also require an application-session bearer actor. SUPER_ADMIN remains provider-proven session authority, never an email-derived directory role. See PLATFORM_CONTRACT.md for rollout, role, online introspection, and data preservation rules."
+    "description": "Identity is the sole platform authority for users, provider identities, tenants, memberships, and SSO/application browser sessions. Trusted server admission uses trustedCIDR (default) or configured secret/dual compatibility mode. Directory operations also require an application-session bearer actor. SUPER_ADMIN uses provider-proven session authority unless explicitly granted or removed by another Super Admin; directory email never grants global access. See PLATFORM_CONTRACT.md for rollout, role, online introspection, and data preservation rules."
   },
   "servers": [
     {
@@ -915,7 +915,7 @@
     },
     "/api/directory/tenants/{iTenantId}/memberships/{iUserId}": {
       "put": {
-        "summary": "Set own tenant membership (tenant admin)",
+        "summary": "Edit member profile and role; global grants require Super Admin",
         "responses": {
           "200": {
             "description": "Success",
@@ -949,12 +949,25 @@
                 "properties": {
                   "role": {
                     "enum": [
+                      "SUPER_ADMIN",
                       "TENANT_ADMIN",
                       "USER"
                     ]
                   },
                   "bEnabled": {
                     "type": "boolean"
+                  },
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 255
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 255
                   }
                 },
                 "required": [
@@ -984,6 +997,93 @@
           },
           {
             "name": "iUserId",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 9007199254740991
+            }
+          }
+        ]
+      }
+    },
+    "/api/directory/tenants/{iTenantId}/users": {
+      "post": {
+        "summary": "Add user by email to an administered tenant",
+        "responses": {
+          "400": {
+            "description": "Invalid request"
+          },
+          "401": {
+            "description": "Missing or revoked actor session"
+          },
+          "403": {
+            "description": "Untrusted server or unauthorized actor"
+          },
+          "409": {
+            "description": "Conflicting record or last administrator removal"
+          },
+          "201": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Membership"
+                }
+              }
+            }
+          }
+        },
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "role": {
+                    "enum": [
+                      "SUPER_ADMIN",
+                      "TENANT_ADMIN",
+                      "USER"
+                    ]
+                  },
+                  "bEnabled": {
+                    "type": "boolean"
+                  },
+                  "displayName": {
+                    "type": [
+                      "string",
+                      "null"
+                    ],
+                    "maxLength": 255
+                  },
+                  "email": {
+                    "type": "string",
+                    "format": "email",
+                    "maxLength": 255
+                  }
+                },
+                "required": [
+                  "email",
+                  "displayName",
+                  "role",
+                  "bEnabled"
+                ],
+                "additionalProperties": false
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "AppSession": []
+          }
+        ],
+        "parameters": [
+          {
+            "name": "iTenantId",
             "in": "path",
             "required": true,
             "schema": {
@@ -1463,12 +1563,25 @@
           },
           "role": {
             "enum": [
+              "SUPER_ADMIN",
               "TENANT_ADMIN",
               "USER"
             ]
           },
           "bEnabled": {
             "type": "boolean"
+          },
+          "claimed": {
+            "type": "boolean"
+          },
+          "superAdmin": {
+            "type": "boolean"
+          },
+          "membershipRole": {
+            "enum": [
+              "TENANT_ADMIN",
+              "USER"
+            ]
           }
         },
         "required": [

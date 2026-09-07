@@ -226,7 +226,7 @@ describe.skipIf(!url)("platform authority (isolated MySQL)", () => {
         await request(app)
           .put(`/api/directory/tenants/${tenantA}/memberships/${aliceId}`)
           .set(auth(rootToken))
-          .send({ role: "SUPER_ADMIN", bEnabled: true })
+          .send({ role: "INVALID_ROLE", bEnabled: true })
       ).status,
     ).toBe(400);
   });

@@ -3,6 +3,7 @@ import mysql from "mysql2/promise";
 import { z } from "zod";
 import * as platform from "./platform";
 import * as store from "./store";
+import { manageMember } from "./memberManagement";
 
 type Trust = (req: express.Request, res: express.Response) => Promise<unknown>;
 const tenantInput = z
@@ -44,6 +45,8 @@ export function installPlatformRoutes(
       } catch (e) {
         if (e instanceof platform.PlatformError)
           res.status(e.status).json({ error: e.message });
+        else if (e instanceof store.DirectoryConflictError)
+          res.status(409).json({ error: e.message });
         else if (e instanceof z.ZodError)
           res.status(400).json({ error: "Invalid request", details: e.issues });
         else if ((e as { code?: string }).code === "ER_DUP_ENTRY")
@@ -220,24 +223,54 @@ export function installPlatformRoutes(
         userId = platform.safeId(req.params.userId);
       const body = z
         .object({
-          role: z.enum(["TENANT_ADMIN", "USER"]),
+          role: z.enum(["SUPER_ADMIN", "TENANT_ADMIN", "USER"]),
           bEnabled: z.boolean(),
+          displayName: z.string().trim().max(255).nullable().optional(),
+          email: z.email().max(255).optional(),
         })
         .strict()
         .parse(req.body);
-      await platform.setMembership(
-        db,
-        session,
-        id,
-        userId,
-        body.role,
-        body.bEnabled,
-      );
+      await manageMember(db, session, id, userId, body);
       res.json(
         (await platform.listMemberships(db, id)).find(
           (m) => m.iUserId === userId,
         ),
       );
+    }),
+  );
+  router.post(
+    "/directory/tenants/:id/users",
+    route(async (req, res) => {
+      const session = await actor(req),
+        id = platform.safeId(req.params.id);
+      await platform.requireTenantAdmin(db, session, id);
+      const body = z
+        .object({
+          email: z.email().max(255),
+          displayName: z.string().trim().max(255).nullable(),
+          role: z.enum(["SUPER_ADMIN", "TENANT_ADMIN", "USER"]),
+          bEnabled: z.boolean(),
+        })
+        .strict()
+        .parse(req.body);
+      if (body.role === "SUPER_ADMIN") superAdmin(session);
+      const user = await store.ensureDirectoryUser(db, {
+        email: body.email,
+        displayName: body.displayName,
+        idempotencyKey: null,
+        actorUserId: session.iUserId,
+      });
+      await manageMember(db, session, id, user.iUserId, {
+        role: body.role,
+        bEnabled: body.bEnabled,
+      });
+      res
+        .status(201)
+        .json(
+          (await platform.listMemberships(db, id)).find(
+            (m) => m.iUserId === user.iUserId,
+          ),
+        );
     }),
   );
   router.patch(

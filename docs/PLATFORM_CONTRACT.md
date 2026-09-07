@@ -24,7 +24,7 @@ All following APIs require trusted server admission, using the existing `IDENTIT
 }
 ```
 
-Membership roles are `TENANT_ADMIN` and `USER`, with a non-null tenant and unique `(iTenantId,iUserId)`. `SUPER_ADMIN` is a synthetic response role across all tenants, including disabled tenants in administrative listings. It is never stored as a membership row. Privilege is copied from the provider-proven SSO session/handoff code, never recomputed from user email at redemption. A SUPER_ADMIN may inspect disabled tenants but cannot select one for active work.
+Membership roles are `TENANT_ADMIN` and `USER`, with a non-null tenant and unique `(iTenantId,iUserId)`. `SUPER_ADMIN` is a synthetic response role across all tenants, including disabled tenants in administrative listings. It is never stored as a membership row. Migration `0004_user_role_override` adds nullable `identity_tbl_User.bSuperAdminOverride`: NULL preserves provider-proven SSO authority, 1 explicitly grants global access, and 0 explicitly removes it. Only a current Super Admin can change this override. SSO, application introspection and code redemption read it live; directory email never grants global access. A SUPER_ADMIN may inspect disabled tenants but cannot select one for active work.
 
 Ordinary sessions enumerate only enabled tenant memberships in enabled tenants. Introspection reads current membership on each call, so role changes/disablement take effect without local authorization caches. Selection returns null if access is later removed. Consumers must fail closed on Identity unavailability; session revocation/authorization is online for this POC. Sessions preserve the existing policy of remaining valid until revoked; account/admin revoke-all covers SSO and app sessions together. No tenant/membership event feed is added in this PR because consumers check online.
 
@@ -38,13 +38,15 @@ Every directory read/write requires server admission **and** `Authorization: Bea
 | `POST /api/directory/tenants` | SUPER_ADMIN, `{name,slug}` → 201 tenant; duplicate slug → 409 |
 | `PATCH /api/directory/tenants/:id` | Own TENANT_ADMIN or SUPER_ADMIN, `{name?,slug?,bEnabled?}`; enable/disable requires SUPER_ADMIN |
 | `GET /api/directory/tenants/:id/memberships` | Own TENANT_ADMIN or SUPER_ADMIN → `{memberships:[{iUserId,email,displayName,role,bEnabled}]}` |
-| `PUT /api/directory/tenants/:id/memberships/:userId` | Own TENANT_ADMIN or SUPER_ADMIN, `{role,bEnabled}` → membership |
+| `PUT /api/directory/tenants/:id/memberships/:userId` | Own TENANT_ADMIN or SUPER_ADMIN, `{role,bEnabled,displayName?,email?}` → membership; Super Admin may also assign `SUPER_ADMIN` |
 | `GET /api/directory/users?query=&limit=&cursor=` | SUPER_ADMIN, existing `{items,nextCursor}` shape |
 | `GET /api/directory/users/:id` | SUPER_ADMIN, existing minimal directory user |
 | `POST /api/directory/users` | SUPER_ADMIN, existing `{email,displayName?,idempotencyKey?}` → existing minimal directory user |
 | `PATCH /api/directory/users/:id` | SUPER_ADMIN, `{displayName:string|null}` → directory user |
 
-Tenant admins select from users already in their tenant; platform admins create/find users and assign initial access. Direct membership writes can assign a known central user ID. Last enabled tenant administrator removal is rejected with 409 under a per-tenant transaction lock. New tenants may initially have zero members; SUPER_ADMIN can provision the first tenant administrator. No tenant deletion, arbitrary SUPER_ADMIN grants or tenant merge API is exposed. User merges move non-conflicting memberships and legacy mappings; conflicting roles/enablement must be reconciled before merging.
+Tenant admins can add a user by email with `POST /api/directory/tenants/:id/users` (`{email,displayName,role,bEnabled}`), without browsing the global directory. Existing imported Google email bindings are recognized when the primary user email is missing, preventing duplicate pending accounts. Ambiguous email matches return 409 for explicit reconciliation.
+
+Tenant Admins may assign `TENANT_ADMIN` or `USER`, and cannot modify Super Admins. Super Admins may assign any of the three roles. Profile and role edits commit together with an audit entry; linked sign-in emails cannot be changed through membership editing. Last enabled tenant administrator and last global administrator removal return 409. New tenants may initially have zero members. User merges move non-conflicting memberships and legacy mappings; conflicting roles/enablement must be reconciled before merging. No tenant deletion or tenant merge API is exposed.
 
 IDs are positive safe JSON integers (maximum 9007199254740991). Unknown/unsafe identifiers and invalid payloads are rejected. Mutations record their actor and target in `identity_tbl_Audit` in the same transaction. Directory-user idempotency keys preserve existing global key semantics; reuse for a different email returns conflict. Tenant creation is create-by-unique-slug, not an ensure operation: repeat submissions return 409 so clients must use the listed tenant explicitly.
 

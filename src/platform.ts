@@ -60,9 +60,10 @@ export async function getAppSession(
 ): Promise<AppSession | null> {
   if (!/^[0-9a-f]{64}$/.test(token)) return null;
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT sSessionId, iUserId, bSuperAdmin,
-    sProvider, sSubject, sAppOrigin, iSelectedTenantId, dtCreated FROM identity_tbl_Session
-    WHERE sSessionId = ? AND dtRevoked IS NULL AND sAppOrigin IS NOT NULL`,
+    `SELECT s.sSessionId,s.iUserId,COALESCE(u.bSuperAdminOverride,s.bSuperAdmin) AS bSuperAdmin,
+    s.sProvider,s.sSubject,s.sAppOrigin,s.iSelectedTenantId,s.dtCreated
+    FROM identity_tbl_Session s JOIN identity_tbl_User u ON u.iUserId=s.iUserId
+    WHERE s.sSessionId = ? AND s.dtRevoked IS NULL AND s.sAppOrigin IS NOT NULL`,
     [tokenHash(token)],
   );
   if (!rows.length) return null;
@@ -183,7 +184,9 @@ export async function updateTenant(
 }
 export async function listMemberships(pool: mysql.Pool, id: number) {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT m.iUserId, u.email, u.displayName, m.role, m.bEnabled
+    `SELECT m.iUserId, u.email, u.displayName,m.role,m.bEnabled,
+    COALESCE(u.bSuperAdminOverride,EXISTS(SELECT 1 FROM identity_tbl_Session s WHERE s.iUserId=u.iUserId AND s.bSuperAdmin=1 AND s.dtRevoked IS NULL)) AS superAdmin,
+    EXISTS(SELECT 1 FROM identity_tbl_Identity i WHERE i.iUserId=u.iUserId) AS claimed
     FROM identity_tbl_Membership m JOIN identity_tbl_User u ON u.iUserId = m.iUserId WHERE m.iTenantId = ? ORDER BY m.iUserId`,
     [id],
   );
@@ -191,7 +194,11 @@ export async function listMemberships(pool: mysql.Pool, id: number) {
     iUserId: safeId(r.iUserId),
     email: r.email,
     displayName: r.displayName,
-    role: r.role as MembershipRole,
+    role: (r.superAdmin ? "SUPER_ADMIN" : r.role) as
+      MembershipRole | "SUPER_ADMIN",
+    membershipRole: r.role as MembershipRole,
+    superAdmin: Boolean(r.superAdmin),
+    claimed: Boolean(r.claimed),
     bEnabled: Boolean(r.bEnabled),
   }));
 }
