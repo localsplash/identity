@@ -60,6 +60,12 @@ IDs are positive safe JSON integers (maximum 9007199254740991). Unknown/unsafe i
 
 ## Settings and cutover
 
+For the explicitly disposable `dockerappvm01-dev` environment, the owner has
+authorized deleting obsolete stores and compatibility data. The preservation and
+legacy-import guidance below describes migration into environments that need it;
+it is not a gate on this Dev cleanup. Deploy canonical consumers, delete their
+retired objects, and verify the remaining single authority.
+
 NocoDB base `PlatformConfig`, table `cfg_tbl_Setting`, fields `app`, `settingKey`, `settingValue`, `description`, `bSecret`, `dtCreated`, `dtUpdated` plus the NocoDB `Id`. Resolution is nonblank environment override, exact `identity` scope, then global `*`; Identity has no parent scope. Other apps' scope parents are fixed in the platform plan. Duplicate bases/tables/scoped keys are errors; blank seed rows are unset. Writes target the `identity` scope and do not overwrite global rows. Runtime reads do not bootstrap missing objects. Bootstrap explicitly creates the canonical table and seeds identity-scoped empty fields. Use `*` for intentionally shared `PARENT_DOMAIN`/`trustedCIDR`; provider/database secrets stay in `identity`.
 
 This branch requires canonical settings. Before switching a deployed Identity image, export existing `IdentityBase/auth_tbl_Settings` records to a protected file and transform with `scripts/convert-legacy-settings.mjs`; import the result into `PlatformConfig/cfg_tbl_Setting`. This maps legacy `Key/Value/Description` explicitly and does not print secret values into normal logs. The converter's stdout contains secrets, so use a file under `umask 077`. Preserve source data until cutover validation passes. There is no automatic base rename or legacy fallback writer.
