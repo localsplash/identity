@@ -69,9 +69,11 @@ current `src/migrations.ts`, `src/platform.ts`, `src/platformRoutes.ts`,
 | Automatic settings/base rename and dual reader | Canonical PlatformConfig reader plus explicit protected export/convert/import; preserve legacy source during cutover |
 | Shared business numbers | `identity_tbl_PhoneNumber`, actor-authorized management, audited import and session number grants |
 
-Consolidation implementation does not prove that a particular deployed database
-was moved or that legacy mappings/numbers were imported. Preserve reviewed
-manifests, backups and validation evidence for each deployment.
+Consolidation implementation does not prove deployment. On the disposable
+`dockerappvm01-dev` host, the owner has authorized destructive retirement of old
+application stores and compatibility objects; no preservation or rollback window
+is required. Current Identity users, tenants, memberships and shared numbers
+remain the active authority. Keep deployment evidence, not duplicate authorities.
 
 ## Remaining issue #16 work
 
@@ -88,8 +90,9 @@ manifests, backups and validation evidence for each deployment.
 - Session/ledger cosmetic renames are deferred. Any later migration must preserve
   deployed readers, session tokens and migration history; never edit released
   migrations to fit the original issue text.
-- Verify each environment's PlatformConfig scopes, protected legacy conversion,
-  database cutover and consumer adoption separately from code completion.
+- Verify each environment's PlatformConfig scopes, database cutover and consumer
+  adoption separately from code completion. The disposable Dev cleanup removes
+  obsolete legacy stores directly; it does not require copying their data.
 
 The active repositories are Identity, AidaAdmin, OfficePulseAidaIntegration,
 EchoOrchestrator, EchoDatabase, EchoWeb, EchoService and EchoMedia. AidaHandset and
