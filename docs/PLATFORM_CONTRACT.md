@@ -2,6 +2,13 @@
 
 Identity owns `platform_db`: users, provider identities, tenants (businesses), memberships, SSO sessions and application browser sessions. Echo and Aida retain domain records and canonical ID mappings. Applications must not create an independent user, membership, or browser-session authority.
 
+PBX configuration is owned by the OfficePulse/Asterisk installation. Extensions,
+queues, queue membership, trunks and applied DID routes are read through the
+OfficePulse integration API. Identity's shared phone-number registry grants
+business access; it does not provision or mirror PBX configuration. See
+[PBX ownership and issue reconciliation](PBX_OWNERSHIP.md) for the POC boundary
+and the remaining requirements from issue #16.
+
 ## Session protocol
 
 `POST /api/token {code,redirect_uri}` preserves all existing fields and adds `appSession: {token}`. The new opaque 64-hex token belongs in an HttpOnly, Secure, host-only application cookie, with SameSite=Lax. Consumers validate browser CSRF/origin on mutations and never forward browser-controlled server credentials. Application tokens are SHA-256 hashed inside the same `identity_tbl_Session` table as SSO sessions, with `sAppOrigin` distinguishing token types. SSO cookies cannot be redeemed as application tokens and application credentials cannot sign into Identity's account/admin UI.
