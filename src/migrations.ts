@@ -232,12 +232,32 @@ async function userRoleOverride(conn: mysql.PoolConnection): Promise<void> {
     );
 }
 
+async function sharedPhoneNumbers(conn: mysql.PoolConnection): Promise<void> {
+  await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_PhoneNumber (
+    iPhoneNumberId BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+    iTenantId BIGINT NOT NULL,
+    phoneNumber VARCHAR(16) NOT NULL,
+    label VARCHAR(100) NOT NULL DEFAULT '',
+    bVoice TINYINT(1) NOT NULL DEFAULT 1,
+    bMessaging TINYINT(1) NOT NULL DEFAULT 1,
+    bEnabled TINYINT(1) NOT NULL DEFAULT 1,
+    accessPolicy ENUM('TENANT_MEMBERS') NOT NULL DEFAULT 'TENANT_MEMBERS',
+    iVersion INT NOT NULL DEFAULT 1,
+    dtCreated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3),
+    dtUpdated DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3) ON UPDATE CURRENT_TIMESTAMP(3),
+    UNIQUE KEY uq_phone_number (phoneNumber),
+    KEY ix_phone_tenant (iTenantId),
+    CONSTRAINT fk_phone_tenant FOREIGN KEY (iTenantId) REFERENCES identity_tbl_Tenant(iTenantId)
+  ) ENGINE=InnoDB`);
+}
+
 /** Ordered, append-only. Never rename or reorder an entry once released. */
 export const MIGRATIONS: Migration[] = [
   { name: "0001_baseline", run: baseline },
   { name: "0002_directory_idempotency", run: directoryIdempotency },
   { name: "0003_platform_directory_sessions", run: platformDirectory },
   { name: "0004_user_role_override", run: userRoleOverride },
+  { name: "0005_shared_phone_numbers", run: sharedPhoneNumbers },
 ];
 
 const MIGRATION_LOCK = "identity_db_migrations";

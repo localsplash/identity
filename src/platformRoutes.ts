@@ -3,6 +3,11 @@ import mysql from "mysql2/promise";
 import { z } from "zod";
 import * as platform from "./platform";
 import * as store from "./store";
+import {
+  listPhoneNumbers,
+  savePhoneNumber,
+  phoneNumberInput,
+} from "./phoneNumbers";
 import { manageMember } from "./memberManagement";
 
 type Trust = (req: express.Request, res: express.Response) => Promise<unknown>;
@@ -104,6 +109,9 @@ export function installPlatformRoutes(
           superAdmin: session.bSuperAdmin,
         },
         tenants,
+        numbers: (await listPhoneNumbers(db, session)).filter(
+          (n) => n.bEnabled,
+        ),
         selectedTenantId,
       });
     }),
@@ -162,6 +170,56 @@ export function installPlatformRoutes(
         iTenantId: platform.safeId(rows[0].iTenantId),
         bEnabled: Boolean(rows[0].bEnabled),
       });
+    }),
+  );
+  router.get(
+    "/directory/tenants/:id/numbers",
+    route(async (req, res) => {
+      const session = await actor(req),
+        id = platform.safeId(req.params.id);
+      await platform.requireTenantAdmin(db, session, id);
+      res.json({ numbers: await listPhoneNumbers(db, session, id) });
+    }),
+  );
+  router.post(
+    "/directory/tenants/:id/numbers",
+    route(async (req, res) => {
+      const session = await actor(req),
+        id = platform.safeId(req.params.id);
+      await platform.requireTenantAdmin(db, session, id);
+      const token = req.get("Authorization")!.slice(7);
+      res
+        .status(201)
+        .json(
+          await savePhoneNumber(
+            db,
+            token,
+            id,
+            null,
+            phoneNumberInput.parse(req.body),
+          ),
+        );
+    }),
+  );
+  router.put(
+    "/directory/tenants/:id/numbers/:numberId",
+    route(async (req, res) => {
+      await actor(req);
+      const raw = z
+        .object({ expectedVersion: z.number().int().positive() })
+        .passthrough()
+        .parse(req.body);
+      const { expectedVersion, ...fields } = raw;
+      res.json(
+        await savePhoneNumber(
+          db,
+          req.get("Authorization")!.slice(7),
+          platform.safeId(req.params.id),
+          platform.safeId(req.params.numberId),
+          phoneNumberInput.parse(fields),
+          expectedVersion,
+        ),
+      );
     }),
   );
   router.get(
