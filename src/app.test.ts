@@ -127,7 +127,9 @@ vi.mock('./settings', async (importOriginal) => {
       failIfAsked();
     }
     async listForAdmin() {
-      return Object.entries({ ...fake.settings, ...fake.overrides }).map(([key, value]) => ({
+      return Object.entries({ ...fake.settings, ...fake.overrides })
+        .filter(([key]) => actual.isConsoleManaged(key))
+        .map(([key, value]) => ({
         key,
         app: actual.SETTINGS_SCOPE,
         value: actual.isSecretKey(key) ? '' : value,
@@ -135,12 +137,13 @@ vi.mock('./settings', async (importOriginal) => {
         secret: actual.isSecretKey(key),
         description: '',
         source: key in fake.overrides ? 'environment' : 'store',
-      }));
+        }));
     }
     // Mirrors the real store's refusals by calling into it rather than
     // restating them, so the rules cannot drift apart from the mock.
     async set(key: string, value: string, app: string = actual.SETTINGS_SCOPE) {
       if (!actual.isManagedScope(app)) throw new actual.SettingScopeError(app);
+      if (!actual.isConsoleManaged(key)) throw new actual.SettingUnmanagedError(key);
       if (app === '*' && actual.isSecretKey(key)) throw new actual.SettingScopeError('*', key);
       if (app === actual.SETTINGS_SCOPE && key in fake.overrides)
         throw new actual.SettingOverriddenError(key);
@@ -685,6 +688,18 @@ describe('/admin config and the environment', () => {
       .send({ value: 'carrier', app: 'not-an-app' });
     expect(res.status).toBe(400);
     expect(res.body.error).toContain('not a scope this console manages');
+  });
+
+  it('refuses a carrier-application credential and says where it belongs', async () => {
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app)
+      .put('/api/admin/config/BANDWIDTH_API_TOKEN')
+      .set('Cookie', `identity_sso=${session}`)
+      .send({ value: 'legacy', app: 'service' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('carrier application');
+    expect(fake.settings.BANDWIDTH_API_TOKEN).toBeUndefined();
   });
 
   it('refuses a secret in the global scope, where every app could read it', async () => {

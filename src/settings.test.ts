@@ -336,6 +336,27 @@ describe('PlatformConfig scope contract',()=>{
     const pass=service.find(i=>i.key==='WEBHOOK_BASIC_PASS');
     expect(pass).toMatchObject({secret:true,value:'',hasValue:true});
   });
+  it('hides carrier-application credentials even when rows exist for them',async()=>{
+    // Dropping them from KNOWN_SETTINGS alone would only remove the help text:
+    // listForAdmin reads rows from the store, so an existing row would still
+    // have been offered for editing, just undescribed.
+    scoped([
+      {Id:1,app:'service',settingKey:'BANDWIDTH_API_TOKEN',settingValue:'legacy'},
+      {Id:2,app:'service',settingKey:'BANDWIDTH_MESSAGING_API_BASE_URL',settingValue:'https://sandbox'},
+      {Id:3,app:'service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier'},
+    ]);
+    const keys=(await new SettingsStore(config,{}).listForAdmin()).map(i=>i.key);
+    expect(keys).not.toContain('BANDWIDTH_API_TOKEN');
+    // The API base is deployment-wide, not per-carrier, so it stays.
+    expect(keys).toContain('BANDWIDTH_MESSAGING_API_BASE_URL');
+    expect(keys).toContain('WEBHOOK_BASIC_USER');
+  });
+  it('refuses to write a carrier-application credential',async()=>{
+    scoped([]);
+    await expect(new SettingsStore(config,{}).set('BANDWIDTH_API_SECRET','x','service'))
+      .rejects.toMatchObject({name:'SettingUnmanagedError'});
+    expect(vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST')).toBeUndefined();
+  });
   it('writes to the scope it was given, not always its own',async()=>{
     scoped([]);
     await new SettingsStore(config,{}).set('WEBHOOK_BASIC_USER','carrier','service');

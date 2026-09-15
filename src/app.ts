@@ -13,6 +13,7 @@ import {
   SettingsUnavailableError,
   SettingOverriddenError,
   SettingScopeError,
+  SettingUnmanagedError,
   SETTINGS_BASE_NAME,
   SETTINGS_TABLE_NAME,
   SETTINGS_SCOPE,
@@ -1850,6 +1851,8 @@ export function buildApp() {
         if (err instanceof SettingOverriddenError)
           return res.status(409).json({ error: err.message });
         if (err instanceof SettingScopeError)
+          return res.status(400).json({ error: err.message });
+        if (err instanceof SettingUnmanagedError)
           return res.status(400).json({ error: err.message });
         throw err;
       }

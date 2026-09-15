@@ -24,6 +24,31 @@ export function isManagedScope(app: string): app is ManagedScope {
 }
 
 /**
+ * Keys this console deliberately does not manage.
+ *
+ * Bandwidth credentials belong to a carrier application, which binds per-DID
+ * through `sms_tbl_BusinessPhone.iCarrierApplicationId`. The PlatformConfig
+ * `BANDWIDTH_*` rows are only the fallback for a phone that has no such row,
+ * and the per-carrier credentials win whenever one exists. Offering them here
+ * would steer an operator into the deprecated path instead of the carrier
+ * application that actually routes their number.
+ *
+ * `BANDWIDTH_MESSAGING_API_BASE_URL` is NOT in this list: `bandwidthBase()`
+ * reads it from PlatformConfig alone and never consults carrier settings, so
+ * it is a genuine deployment-wide endpoint, not a per-carrier credential.
+ */
+export const UNMANAGED_KEYS = [
+  'BANDWIDTH_ACCOUNT_ID',
+  'BANDWIDTH_API_TOKEN',
+  'BANDWIDTH_API_SECRET',
+  'BANDWIDTH_APPLICATION_ID',
+] as const;
+
+export function isConsoleManaged(key: string): boolean {
+  return !(UNMANAGED_KEYS as readonly string[]).includes(key);
+}
+
+/**
  * Keys whose value must never be returned to a browser, and which may not be
  * written to the global `*` scope.
  *
@@ -162,27 +187,11 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     description: 'Comma-separated browser origins EchoService accepts. Deployment configuration.',
   },
   {
-    key: 'BANDWIDTH_ACCOUNT_ID',
-    description:
-      'Legacy fallback, used only when a business phone has no sms_tbl_CarrierApplication ' +
-      'row. Per-carrier credentials there win. Prefer migrating the phone over setting this.',
-  },
-  {
-    key: 'BANDWIDTH_API_TOKEN',
-    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
-  },
-  {
-    key: 'BANDWIDTH_API_SECRET',
-    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
-  },
-  {
-    key: 'BANDWIDTH_APPLICATION_ID',
-    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
-  },
-  {
     key: 'BANDWIDTH_MESSAGING_API_BASE_URL',
     description:
-      "Bandwidth's own API base. Defaults to https://messaging.bandwidth.com/api/v2 when blank.",
+      "Bandwidth's own API base, deployment-wide. Defaults to " +
+      'https://messaging.bandwidth.com/api/v2 when blank. Not a credential and not ' +
+      'per-carrier: account credentials belong to the carrier application.',
   }
 ];
 
@@ -233,6 +242,19 @@ export class SettingOverriddenError extends Error {
         'store. Change it there (and restart) or unset it to manage it here.'
     );
     this.name = 'SettingOverriddenError';
+  }
+}
+
+/** Raised when a write targets a key this console deliberately does not manage. */
+export class SettingUnmanagedError extends Error {
+  constructor(public key: string) {
+    super(
+      `${key} is a carrier-application credential and is not managed here. It binds to a ` +
+        'carrier application, which binds per-DID through sms_tbl_BusinessPhone. Set it on ' +
+        'the carrier application instead; the PlatformConfig row is only a fallback for a ' +
+        'business phone that has none.'
+    );
+    this.name = 'SettingUnmanagedError';
   }
 }
 
@@ -592,7 +614,7 @@ export class SettingsStore {
     // are different settings read by different applications, and showing only
     // the winner would hide the one the operator came to edit.
     const items: AdminSetting[] = rows
-      .filter((r) => r.settingKey && isManagedScope(r.app))
+      .filter((r) => r.settingKey && isManagedScope(r.app) && isConsoleManaged(r.settingKey))
       .map((r) => {
         const secret = isSecretKey(r.settingKey);
         // Only this app's own environment can override a row, and only for
@@ -633,6 +655,7 @@ export class SettingsStore {
   /** Write a key to the store. Refused when the environment pins it. */
   async set(key: string, value: string, app: string = SETTINGS_SCOPE): Promise<void> {
     if (!isManagedScope(app)) throw new SettingScopeError(app);
+    if (!isConsoleManaged(key)) throw new SettingUnmanagedError(key);
     // The store's own rule, enforced rather than just documented: a secret in
     // '*' is readable by every application that can reach PlatformConfig.
     if (app === '*' && isSecretKey(key)) throw new SettingScopeError('*', key);
