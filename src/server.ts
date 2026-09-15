@@ -1,3 +1,4 @@
+import './timezone';
 import { buildApp } from './app';
 import { loadConfig } from './config';
 import { LOCAL_CONFIG_PATH, applyLocalConfig } from './localConfig';

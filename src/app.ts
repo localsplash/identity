@@ -1,3 +1,4 @@
+import { buildInfo } from './buildInfo';
 import express from "express";
 import mysql from "mysql2/promise";
 import path from "path";
@@ -420,7 +421,7 @@ export function buildApp() {
     // Deliberately settings-free: it answers while the store is down, which
     // is what makes it useful for telling "the process is up" apart from
     // "the process cannot read its configuration".
-    res.json({ ok: true, service: "identity" });
+    res.json({ ok: true, service: "identity", ...buildInfo });
   });
 
   /**
