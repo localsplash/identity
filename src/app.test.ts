@@ -1,3 +1,4 @@
+import { buildInfo } from './buildInfo';
 import { describe, it, expect, beforeEach, vi } from 'vitest';
 import crypto from 'crypto';
 import request from 'supertest';
@@ -716,7 +717,7 @@ describe('settings store unavailable', () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const res = await request(app).get('/healthz');
     expect(res.status).toBe(200);
-    expect(res.body).toEqual({ ok: true, service: 'identity' });
+    expect(res.body).toEqual({ ok: true, service: 'identity', ...buildInfo });
   });
 
   it('re-detects on retry rather than remembering the failure', async () => {

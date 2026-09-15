@@ -11,13 +11,19 @@
 # browser and saves them to the identity-config volume.
 services:
   identity:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:?Export Git HEAD before building}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?Export Git committer epoch before building}
+        BUILD_DIRTY: ${BUILD_DIRTY:?Export Git dirty state before building}
     container_name: identity
     hostname: identity
     depends_on:
       db:
         condition: service_healthy
     environment:
+      TZ: ${TZ:-America/Los_Angeles}
       PORT: "3200"
 
       # Where the settings live. Left empty on a fresh install: /setup asks
