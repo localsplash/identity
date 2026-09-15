@@ -8,6 +8,34 @@ export const SETTINGS_BASE_NAME = 'PlatformConfig';
 export const SETTINGS_TABLE_NAME = 'cfg_tbl_Setting';
 export const SETTINGS_SCOPE = 'identity';
 
+/**
+ * Scopes this console may list and write.
+ *
+ * PlatformConfig is shared: EchoService reads `service`, EchoWeb reads
+ * `echo-web` under `echo`, and `*` is read by everything. Managing only
+ * `identity` meant a write for another app's key silently created an
+ * identity-scoped row nobody reads, while the console displayed it as set.
+ */
+export const MANAGED_SCOPES = ['*', 'identity', 'echo', 'echo-web', 'service'] as const;
+export type ManagedScope = (typeof MANAGED_SCOPES)[number];
+
+export function isManagedScope(app: string): app is ManagedScope {
+  return (MANAGED_SCOPES as readonly string[]).includes(app);
+}
+
+/**
+ * Keys whose value must never be returned to a browser, and which may not be
+ * written to the global `*` scope.
+ *
+ * WEBHOOK_BASIC_PASS is why this is not the narrower word list it looks like
+ * it should be: it carries PASS, not PASSWORD, so the earlier pattern did not
+ * match and the credential gating EchoService's webhooks would have been
+ * stored unflagged.
+ */
+export function isSecretKey(key: string): boolean {
+  return /SECRET|PASSWORD|PASS|TOKEN|APP_KEY|CREDENTIAL/i.test(key);
+}
+
 export interface SettingDef {
   key: string;
   description: string;
@@ -113,6 +141,49 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       'Read-only UISP CRM App Key. Used by applications to look up ' +
       'subscriber records when provisioning accounts.',
   },
+  // ── Read by EchoService, in the 'service' scope ────────────────────────────
+  {
+    key: 'WEBHOOK_BASIC_USER',
+    description:
+      'Basic-auth username carriers present on /webhooks/*. Callers inside trustedCIDR ' +
+      'are admitted without it. WARNING: leaving BOTH this and WEBHOOK_BASIC_PASS blank ' +
+      'disables basic auth entirely, leaving trustedCIDR as the only check on endpoints ' +
+      'that write inbound messages.',
+  },
+  {
+    key: 'WEBHOOK_BASIC_PASS',
+    description:
+      'Basic-auth password for /webhooks/*. Rotating it takes effect within 30 seconds, ' +
+      'with no restart. Bandwidth reaches Echo from outside the trusted network, so this ' +
+      'is the real control for it.',
+  },
+  {
+    key: 'CORS_ORIGINS',
+    description: 'Comma-separated browser origins EchoService accepts. Deployment configuration.',
+  },
+  {
+    key: 'BANDWIDTH_ACCOUNT_ID',
+    description:
+      'Legacy fallback, used only when a business phone has no sms_tbl_CarrierApplication ' +
+      'row. Per-carrier credentials there win. Prefer migrating the phone over setting this.',
+  },
+  {
+    key: 'BANDWIDTH_API_TOKEN',
+    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
+  },
+  {
+    key: 'BANDWIDTH_API_SECRET',
+    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
+  },
+  {
+    key: 'BANDWIDTH_APPLICATION_ID',
+    description: 'Legacy fallback — see BANDWIDTH_ACCOUNT_ID.',
+  },
+  {
+    key: 'BANDWIDTH_MESSAGING_API_BASE_URL',
+    description:
+      "Bandwidth's own API base. Defaults to https://messaging.bandwidth.com/api/v2 when blank.",
+  }
 ];
 
 export type Settings = Record<string, string>;
@@ -165,6 +236,24 @@ export class SettingOverriddenError extends Error {
   }
 }
 
+/** Raised when a write targets a scope this console may not manage. */
+export class SettingScopeError extends Error {
+  constructor(
+    public app: string,
+    public key?: string
+  ) {
+    super(
+      key
+        ? `${key} looks like a secret, so it cannot be written to the global '*' scope ` +
+          'where every application can read it. Write it to the scope of the app that ' +
+          'needs it.'
+        : `'${app}' is not a scope this console manages. Managed scopes are ` +
+          `${MANAGED_SCOPES.map((m) => `'${m}'`).join(', ')}.`
+    );
+    this.name = 'SettingScopeError';
+  }
+}
+
 /**
  * The settings store could not answer. There is no fallback: an application
  * that cannot read its configuration says so, loudly, rather than carrying
@@ -186,7 +275,13 @@ export type SettingSource = 'environment' | 'store';
 
 export interface AdminSetting {
   key: string;
+  /** Which app reads this row. */
+  app: string;
+  /** Empty for secrets — see `hasValue`. */
   value: string;
+  /** Whether a secret is set, since its value is never sent to the browser. */
+  hasValue: boolean;
+  secret: boolean;
   description: string;
   source: SettingSource;
 }
@@ -491,42 +586,61 @@ export class SettingsStore {
   async listForAdmin(): Promise<AdminSetting[]> {
     const rows = await this.listRows();
     const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
-    const effective = await this.getAll();
-    const scopedRows = new Map<string, NocoTableRow>();
-    for (const row of [...rows.filter(r=>r.app === '*'), ...rows.filter(r=>r.app === SETTINGS_SCOPE)]) scopedRows.set(row.settingKey,row);
-    const items: AdminSetting[] = [...scopedRows.values()]
-      .filter((r) => r.settingKey && (r.app === SETTINGS_SCOPE || r.app === '*'))
-      .map((r) => ({
-        key: r.settingKey,
-        value: this.isOverridden(r.settingKey)
-          ? this.overrides[r.settingKey]
-          : effective[r.settingKey] ?? '',
-        description: r.description == null ? '' : String(r.description),
-        source: this.isOverridden(r.settingKey) ? ('environment' as const) : ('store' as const),
-      }));
+
+    // One entry per (scope, key). Rows are NOT collapsed to an effective
+    // value any more: a `service` row and an `identity` row of the same name
+    // are different settings read by different applications, and showing only
+    // the winner would hide the one the operator came to edit.
+    const items: AdminSetting[] = rows
+      .filter((r) => r.settingKey && isManagedScope(r.app))
+      .map((r) => {
+        const secret = isSecretKey(r.settingKey);
+        // Only this app's own environment can override a row, and only for
+        // its own scope. Another app's overrides are invisible from here.
+        const overridden = r.app === SETTINGS_SCOPE && this.isOverridden(r.settingKey);
+        const value = overridden ? this.overrides[r.settingKey] : String(r.settingValue ?? '');
+        return {
+          key: r.settingKey,
+          app: r.app,
+          value: secret ? '' : value,
+          hasValue: value.trim() !== '',
+          secret,
+          description: r.description == null ? '' : String(r.description),
+          source: overridden ? ('environment' as const) : ('store' as const),
+        };
+      });
 
     // An override for a key the store has no row for yet (NocoDB seeded
     // before the key existed, or bootstrap has not run) is still in force —
     // show it rather than letting it act invisibly.
-    const present = new Set(items.map((i) => i.key));
+    const present = new Set(items.filter((i) => i.app === SETTINGS_SCOPE).map((i) => i.key));
     for (const [key, value] of Object.entries(this.overrides)) {
       if (present.has(key)) continue;
+      const secret = isSecretKey(key);
       items.push({
         key,
-        value,
+        app: SETTINGS_SCOPE,
+        value: secret ? '' : value,
+        hasValue: String(value).trim() !== '',
+        secret,
         description: described.get(key) ?? '',
         source: 'environment',
       });
     }
-    return items.sort((a, b) => a.key.localeCompare(b.key));
+    return items.sort((a, b) => a.app.localeCompare(b.app) || a.key.localeCompare(b.key));
   }
 
   /** Write a key to the store. Refused when the environment pins it. */
-  async set(key: string, value: string): Promise<void> {
-    if (this.isOverridden(key)) throw new SettingOverriddenError(key);
+  async set(key: string, value: string, app: string = SETTINGS_SCOPE): Promise<void> {
+    if (!isManagedScope(app)) throw new SettingScopeError(app);
+    // The store's own rule, enforced rather than just documented: a secret in
+    // '*' is readable by every application that can reach PlatformConfig.
+    if (app === '*' && isSecretKey(key)) throw new SettingScopeError('*', key);
+    // Only this app's environment can shadow a row, and only in its own scope.
+    if (app === SETTINGS_SCOPE && this.isOverridden(key)) throw new SettingOverriddenError(key);
     const { tableId } = await this.resolveIds();
     const rows = await this.listRows();
-    const existing = rows.find((r) => r.app === SETTINGS_SCOPE && r.settingKey === key);
+    const existing = rows.find((r) => r.app === app && r.settingKey === key);
     if (existing) {
       await this.api('PATCH', `/api/v2/tables/${tableId}/records`, [
         { Id: existing.Id, settingValue: value },
@@ -534,11 +648,11 @@ export class SettingsStore {
     } else {
       const known = KNOWN_SETTINGS.find((s) => s.key === key);
       await this.api('POST', `/api/v2/tables/${tableId}/records`, {
-        app: SETTINGS_SCOPE,
+        app,
         settingKey: key,
         settingValue: value,
         description: known?.description ?? '',
-        bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(key),
+        bSecret: isSecretKey(key),
       });
     }
     this.cache = null; // read-your-writes

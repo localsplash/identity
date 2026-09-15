@@ -11,8 +11,12 @@ import {
   SettingsStore,
   Settings,
   SettingsUnavailableError,
+  SettingOverriddenError,
+  SettingScopeError,
   SETTINGS_BASE_NAME,
   SETTINGS_TABLE_NAME,
+  SETTINGS_SCOPE,
+  MANAGED_SCOPES,
 } from "./settings";
 import {
   PROVIDERS,
@@ -1816,6 +1820,9 @@ export function buildApp() {
         // Resolved rather than raw, so the list form and the PARENT_DOMAIN
         // fallback are both visible for what they are.
         superAdminDomains: superAdminDomains(settings),
+        // PlatformConfig is shared; the console manages more than its own rows.
+        managedScopes: MANAGED_SCOPES,
+        ownScope: SETTINGS_SCOPE,
       });
     } catch (err) {
       next(err);
@@ -1830,19 +1837,25 @@ export function buildApp() {
       if (!/^[A-Za-z0-9_.-]{1,128}$/.test(key)) {
         return res.status(400).json({ error: "Invalid key" });
       }
-      // An environment override is the deployment's decision, not this
-      // console's: saying so beats accepting a write that would never take
-      // effect.
-      if (settingsStore.isOverridden(key)) {
-        return res.status(409).json({
-          error:
-            `${key} is set in this app's environment, which overrides the settings ` +
-            "store. Change it there (and restart) or unset it to manage it here.",
-        });
-      }
+      // The override and scope rules live in the store, which is the only
+      // place that knows both. An environment override is the deployment's
+      // decision, not this console's.
+      const scope = String((req.body ?? {}).app ?? SETTINGS_SCOPE).trim();
       const value = String((req.body ?? {}).value ?? "");
-      await settingsStore.set(key, value);
-      logger.warn(`[admin] user ${session.iUserId} set cfg_tbl_Setting ${key}`);
+      try {
+        await settingsStore.set(key, value, scope);
+      } catch (err) {
+        // A refused write is an answer, not a fault: say which rule stopped it
+        // rather than letting it surface as a 500.
+        if (err instanceof SettingOverriddenError)
+          return res.status(409).json({ error: err.message });
+        if (err instanceof SettingScopeError)
+          return res.status(400).json({ error: err.message });
+        throw err;
+      }
+      logger.warn(
+        `[admin] user ${session.iUserId} set cfg_tbl_Setting ${scope}/${key}`
+      );
       return res.json({ ok: true });
     } catch (err) {
       next(err);

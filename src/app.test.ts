@@ -80,7 +80,8 @@ vi.mock('./db', () => ({
       : { host: 'db.test', port: 3306, user: 'id', password: '', database: 'id_db' },
 }));
 
-vi.mock('./settings', () => {
+vi.mock('./settings', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./settings')>();
   class SettingsUnavailableError extends Error {
     constructor(
       public reason: string,
@@ -128,16 +129,26 @@ vi.mock('./settings', () => {
     async listForAdmin() {
       return Object.entries({ ...fake.settings, ...fake.overrides }).map(([key, value]) => ({
         key,
-        value,
+        app: actual.SETTINGS_SCOPE,
+        value: actual.isSecretKey(key) ? '' : value,
+        hasValue: String(value ?? '').trim() !== '',
+        secret: actual.isSecretKey(key),
         description: '',
         source: key in fake.overrides ? 'environment' : 'store',
       }));
     }
-    async set(key: string, value: string) {
+    // Mirrors the real store's refusals by calling into it rather than
+    // restating them, so the rules cannot drift apart from the mock.
+    async set(key: string, value: string, app: string = actual.SETTINGS_SCOPE) {
+      if (!actual.isManagedScope(app)) throw new actual.SettingScopeError(app);
+      if (app === '*' && actual.isSecretKey(key)) throw new actual.SettingScopeError('*', key);
+      if (app === actual.SETTINGS_SCOPE && key in fake.overrides)
+        throw new actual.SettingOverriddenError(key);
       fake.settings[key] = value;
     }
   }
   return {
+    ...actual,
     SettingsStore,
     SettingsUnavailableError,
     SETTINGS_BASE_NAME: 'IdentityBase',
@@ -663,6 +674,28 @@ describe('/admin config and the environment', () => {
     expect(res.status).toBe(409);
     expect(res.body.error).toContain('environment');
     expect(fake.settings.APP_BASE_URL).toBeUndefined();
+  });
+
+  it('refuses an unmanaged scope rather than writing a row nothing reads', async () => {
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app)
+      .put('/api/admin/config/WEBHOOK_BASIC_USER')
+      .set('Cookie', `identity_sso=${session}`)
+      .send({ value: 'carrier', app: 'not-an-app' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('not a scope this console manages');
+  });
+
+  it('refuses a secret in the global scope, where every app could read it', async () => {
+    const app = makeApp({ trustedCIDR: LOOPBACK });
+    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
+    const res = await request(app)
+      .put('/api/admin/config/WEBHOOK_BASIC_PASS')
+      .set('Cookie', `identity_sso=${session}`)
+      .send({ value: 'hunter2', app: '*' });
+    expect(res.status).toBe(400);
+    expect(res.body.error).toContain('secret');
   });
 });
 

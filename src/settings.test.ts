@@ -147,7 +147,9 @@ describe('SettingsStore precedence', () => {
       GOOGLE_CLIENT_ID: 'gid',
     });
     const items = await store.listForAdmin();
-    const byKey = Object.fromEntries(items.map((i) => [i.key, i]));
+    const byKey = Object.fromEntries(
+      items.filter((i) => i.app === 'identity').map((i) => [i.key, i])
+    );
 
     expect(byKey.APP_BASE_URL).toMatchObject({
       value: 'https://identity.wisp.net',
@@ -317,6 +319,45 @@ describe('PlatformConfig scope contract',()=>{
   it('rejects duplicates even when values match instead of choosing the last row',async()=>{
     scoped([{Id:1,app:'identity',settingKey:'DB_NAME',settingValue:'platform_db'},{Id:2,app:'identity',settingKey:'DB_NAME',settingValue:'platform_db'}]);
     await expect(new SettingsStore(config,{}).getAll()).rejects.toMatchObject({reason:'duplicate'});
+  });
+  it('lists another app\'s rows instead of hiding them behind its own',async()=>{
+    // The same key in two scopes is two settings read by two applications.
+    // Collapsing to the winner hid the one the operator came to edit.
+    scoped([
+      {Id:1,app:'identity',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'},
+      {Id:2,app:'service',settingKey:'CORS_ORIGINS',settingValue:'https://echo.x.tld'},
+      {Id:3,app:'service',settingKey:'WEBHOOK_BASIC_PASS',settingValue:'hunter2'},
+    ]);
+    const items=await new SettingsStore(config,{}).listForAdmin();
+    const service=items.filter(i=>i.app==='service');
+    expect(service.map(i=>i.key).sort()).toEqual(['CORS_ORIGINS','WEBHOOK_BASIC_PASS']);
+    // WEBHOOK_BASIC_PASS carries PASS, not PASSWORD — the earlier pattern
+    // missed it, so the webhook credential was not treated as a secret.
+    const pass=service.find(i=>i.key==='WEBHOOK_BASIC_PASS');
+    expect(pass).toMatchObject({secret:true,value:'',hasValue:true});
+  });
+  it('writes to the scope it was given, not always its own',async()=>{
+    scoped([]);
+    await new SettingsStore(config,{}).set('WEBHOOK_BASIC_USER','carrier','service');
+    const write=vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST');
+    expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({
+      app:'service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier',
+    });
+  });
+  it('refuses a secret in global scope, where every app can read it',async()=>{
+    scoped([]);
+    await expect(new SettingsStore(config,{}).set('WEBHOOK_BASIC_PASS','hunter2','*'))
+      .rejects.toMatchObject({name:'SettingScopeError'});
+    expect(vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST')).toBeUndefined();
+  });
+  it('an override in this app cannot block a write to another app scope',async()=>{
+    // isOverridden reads THIS app's environment. It says nothing about what
+    // EchoService reads, so it must not veto a service-scoped write.
+    scoped([]);
+    await new SettingsStore(config,{CORS_ORIGINS:'https://pinned.here'})
+      .set('CORS_ORIGINS','https://echo.x.tld','service');
+    const write=vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST');
+    expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({app:'service'});
   });
   it('never updates a global row when writing an identity override',async()=>{
     scoped([{Id:1,app:'*',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'}]);

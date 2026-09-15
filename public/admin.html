@@ -163,6 +163,27 @@ X-Id-Signature: sha256=&lt;hex&gt;
       wrap.appendChild(origin);
     }
 
+    const SCOPE_LABEL = {
+      '*': 'All apps (global)',
+      'identity': 'Identity',
+      'echo': 'Echo (all Echo apps)',
+      'echo-web': 'EchoWeb',
+      'service': 'EchoService',
+    };
+
+    // Blanking both leaves trustedCIDR as the only check on endpoints that
+    // write inbound messages, so it is worth saying out loud rather than
+    // accepting two empty fields silently.
+    function webhookAuthWarning(items) {
+      const get = (k) => items.find((i) => i.app === 'service' && i.key === k);
+      const user = get('WEBHOOK_BASIC_USER');
+      const pass = get('WEBHOOK_BASIC_PASS');
+      if (!user && !pass) return '';
+      if ((user && user.hasValue) || (pass && pass.hasValue)) return '';
+      return 'Webhook basic auth is OFF — both WEBHOOK_BASIC_USER and WEBHOOK_BASIC_PASS are blank. '
+           + 'Only trustedCIDR now guards the carrier webhook endpoints.';
+    }
+
     async function loadConfig() {
       const resp = await fetch('/api/admin/config');
       if (resp.status === 403) { location.href = '/'; return; }
@@ -170,51 +191,80 @@ X-Id-Signature: sha256=&lt;hex&gt;
       renderCallbacks(providers || [], appBaseUrl || '', appBaseUrlSource || '');
       const wrap = document.getElementById('config');
       wrap.innerHTML = '';
-      for (const row of items) {
-        const secret = SECRET_RE.test(row.key);
-        const fromEnv = row.source === 'environment';
-        const div = document.createElement('div');
-        div.className = 'flex flex-col sm:flex-row sm:items-center gap-2';
-        div.innerHTML = `
-          <div class="sm:w-64 flex-shrink-0">
-            <span class="text-sm font-medium text-slate-700 font-mono">${esc(row.key)}</span>
-            ${fromEnv ? '<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-mono align-middle">env</span>' : ''}
-            <span class="block text-[11px] text-slate-400 leading-tight">${esc(row.description || '')}</span>
-          </div>`;
-        const input = document.createElement('input');
-        input.type = secret ? 'password' : 'text';
-        input.placeholder = secret && row.value ? '••••••• (set)' : row.value ? '' : '(not set)';
-        input.value = secret ? '' : row.value;
-        input.className = 'flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono';
-        // Pinned in the environment: show what is in force, but do not offer
-        // an edit that the store would accept and the app would ignore.
-        if (fromEnv) {
-          input.readOnly = true;
-          input.className += ' bg-slate-50 text-slate-500';
-          input.title = "Set in this app's environment; edit it there and restart.";
+
+      const warning = webhookAuthWarning(items || []);
+      if (warning) {
+        const w = document.createElement('div');
+        w.className = 'mb-3 px-3 py-2 rounded-lg bg-red-50 text-red-800 text-sm border border-red-200';
+        w.textContent = warning;
+        wrap.appendChild(w);
+      }
+
+      // Grouped by the app that reads the row: the same key in two scopes is
+      // two different settings, and only one of them is the one being edited.
+      const scopes = [...new Set(items.map((i) => i.app))]
+        .sort((a, b) => (a === 'identity' ? -1 : b === 'identity' ? 1 : a.localeCompare(b)));
+
+      for (const scope of scopes) {
+        const hdr = document.createElement('h3');
+        hdr.className = 'mt-5 mb-2 text-xs font-semibold uppercase tracking-wide text-slate-500';
+        hdr.textContent = SCOPE_LABEL[scope] || scope;
+        wrap.appendChild(hdr);
+
+        for (const row of items.filter((i) => i.app === scope)) {
+          // The server decides what is a secret; it never sends those values.
+          const secret = row.secret !== undefined ? row.secret : SECRET_RE.test(row.key);
+          const fromEnv = row.source === 'environment';
+          const div = document.createElement('div');
+          div.className = 'flex flex-col sm:flex-row sm:items-center gap-2 mb-2';
+          div.innerHTML = `
+            <div class="sm:w-64 flex-shrink-0">
+              <span class="text-sm font-medium text-slate-700 font-mono">${esc(row.key)}</span>
+              ${fromEnv ? '<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-mono align-middle">env</span>' : ''}
+              <span class="block text-[11px] text-slate-400 leading-tight">${esc(row.description || '')}</span>
+            </div>`;
+          const input = document.createElement('input');
+          input.type = secret ? 'password' : 'text';
+          input.placeholder = secret
+            ? (row.hasValue ? '••••••• (set — leave blank to keep)' : '(not set)')
+            : (row.value ? '' : '(not set)');
+          input.value = secret ? '' : row.value;
+          input.className = 'flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono';
+          if (fromEnv) {
+            input.readOnly = true;
+            input.className += ' bg-slate-50 text-slate-500';
+            input.title = "Set in this app's environment; edit it there and restart.";
+          }
+          const btn = document.createElement('button');
+          btn.textContent = 'Save';
+          btn.className = fromEnv
+            ? 'px-3 py-2 rounded-lg bg-slate-200 text-slate-400 text-sm cursor-not-allowed'
+            : 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
+          btn.disabled = fromEnv;
+          btn.onclick = async () => {
+            // A blank secret field means "leave it alone", not "clear it" —
+            // the value was never sent here, so an empty submit would wipe a
+            // credential the operator only meant to look at.
+            if (secret && input.value === '' && row.hasValue) {
+              banner(`${row.key} unchanged — leave blank to keep the current value.`, true);
+              return;
+            }
+            const r = await fetch(`/api/admin/config/${encodeURIComponent(row.key)}`, {
+              method: 'PUT',
+              headers: { 'Content-Type': 'application/json' },
+              body: JSON.stringify({ value: input.value, app: row.app }),
+            });
+            const body = r.ok ? null : await r.json().catch(() => null);
+            banner(
+              r.ok ? `${row.key} saved.` : (body && body.error) || `Failed to save ${row.key}.`,
+              r.ok
+            );
+            if (r.ok) loadConfig();
+          };
+          div.appendChild(input);
+          div.appendChild(btn);
+          wrap.appendChild(div);
         }
-        const btn = document.createElement('button');
-        btn.textContent = 'Save';
-        btn.className = fromEnv
-          ? 'px-3 py-2 rounded-lg bg-slate-200 text-slate-400 text-sm cursor-not-allowed'
-          : 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
-        btn.disabled = fromEnv;
-        btn.onclick = async () => {
-          const r = await fetch(`/api/admin/config/${encodeURIComponent(row.key)}`, {
-            method: 'PUT',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ value: input.value }),
-          });
-          const body = r.ok ? null : await r.json().catch(() => null);
-          banner(
-            r.ok ? `${row.key} saved.` : (body && body.error) || `Failed to save ${row.key}.`,
-            r.ok
-          );
-          if (r.ok) loadConfig();
-        };
-        div.appendChild(input);
-        div.appendChild(btn);
-        wrap.appendChild(div);
       }
     }
 
