@@ -207,6 +207,26 @@ Identity owns its data. `docker-compose.yml` brings up its own MySQL on a
 private network — not published, not shared — and this app applies its own
 schema to it. The only thing it expects to already exist is a NocoDB.
 
+### On a shared MySQL
+
+An environment that runs Identity against its own shared MySQL instead of the
+bundled one creates the database and account with `scripts/db-users.sh`. The
+script is idempotent: it converges the grants on every run, and a new password
+rotates it. Pass the same `DB_*` values Identity reads (its PlatformConfig rows
+or environment) plus the server's admin password:
+
+```bash
+docker run --rm --network <network> -v "$PWD/scripts:/scripts:ro" \
+  -e DB_HOST=<mysql host> -e DB_PASSWORD=… -e MYSQL_ADMIN_PASSWORD=… \
+  mysql:8.4 bash /scripts/db-users.sh
+```
+
+It creates `platform_db` if missing, and the `identity` account (`'%'`) with
+`ALL PRIVILEGES` on it and nothing else, since Identity applies its own schema.
+`DB_NAME`, `DB_USER`, `DB_PORT` and `MYSQL_ADMIN_USER` override the defaults.
+The bundled MySQL doesn't need the script: it creates the same account from
+`MYSQL_USER` when its volume is first initialised.
+
 ## Configuration
 
 **Zero-config is the intended path.** A fresh instance is expected at
@@ -585,7 +605,8 @@ one place. The pool connects lazily on first use, which makes "not filled
 in yet" an ordinary first-run state rather than a crash: the app still
 listens, `/setup` says which of the two stores is missing, and the schema is
 applied as soon as the coordinates work. A change of coordinates takes a
-restart.
+restart. On a shared MySQL the account behind them comes from
+`scripts/db-users.sh` ([On a shared MySQL](#on-a-shared-mysql)).
 
 ### Migrations
 
