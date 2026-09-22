@@ -65,6 +65,8 @@ services:
       # Holds config.json: the address of the settings store, and nothing
       # else. Survives a rebuild, so an instance is set up exactly once.
       - identity-config:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       # Loopback only. Public traffic arrives through a reverse proxy on
       # npm_network, which reaches this container as http://identity:3200.
@@ -83,8 +85,11 @@ services:
       MYSQL_DATABASE: ${DB_NAME:-platform_db}
       MYSQL_USER: ${DB_USER:-identity}
       MYSQL_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
+      TZ: America/Los_Angeles
     volumes:
       - identity-db-data:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     healthcheck:
       # identity waits on this: it applies migrations on the first tick after
       # boot, and a MySQL still initialising would only make that retry.

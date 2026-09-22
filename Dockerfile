@@ -1,4 +1,5 @@
 FROM node:22-alpine AS build
+RUN apk add --no-cache tzdata
 WORKDIR /app
 COPY package*.json ./
 RUN npm ci
