@@ -168,20 +168,19 @@ X-Id-Signature: sha256=&lt;hex&gt;
       'identity': 'Identity',
       'echo': 'Echo (all Echo apps)',
       'echo-web': 'EchoWeb',
-      'service': 'EchoService',
+      'echo-service': 'EchoService',
     };
 
     // Blanking both leaves trustedCIDR as the only check on endpoints that
     // write inbound messages, so it is worth saying out loud rather than
     // accepting two empty fields silently.
     function webhookAuthWarning(items) {
-      const get = (k) => items.find((i) => i.app === 'service' && i.key === k);
+      const get = (k) => ['echo-service', 'echo', '*'].map((app) => items.find((i) => i.app === app && i.key === k && i.hasValue)).find(Boolean);
       const user = get('WEBHOOK_BASIC_USER');
       const pass = get('WEBHOOK_BASIC_PASS');
-      if (!user && !pass) return '';
       if ((user && user.hasValue) || (pass && pass.hasValue)) return '';
       return 'Webhook basic auth is OFF — both WEBHOOK_BASIC_USER and WEBHOOK_BASIC_PASS are blank. '
-           + 'Only trustedCIDR now guards the carrier webhook endpoints.';
+           + 'External carrier requests are unauthenticated until the credentials are configured.';
     }
 
     async function loadConfig() {

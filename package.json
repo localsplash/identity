@@ -10,7 +10,8 @@
     "dev": "tsx watch src/server.ts",
     "lint": "eslint .",
     "format": "prettier --write .",
-    "test:version": "node --test scripts/check-build-info.mjs"
+    "test:version": "node --test scripts/check-build-info.mjs",
+    "audit:settings": "node dist/audit-settings.js"
   },
   "keywords": [],
   "author": "",

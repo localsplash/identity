@@ -11,12 +11,12 @@ export const SETTINGS_SCOPE = 'identity';
 /**
  * Scopes this console may list and write.
  *
- * PlatformConfig is shared: EchoService reads `service`, EchoWeb reads
+ * PlatformConfig is shared: EchoService reads `echo-service`, EchoWeb reads
  * `echo-web` under `echo`, and `*` is read by everything. Managing only
  * `identity` meant a write for another app's key silently created an
  * identity-scoped row nobody reads, while the console displayed it as set.
  */
-export const MANAGED_SCOPES = ['*', 'identity', 'echo', 'echo-web', 'service'] as const;
+export const MANAGED_SCOPES = ['*', 'identity', 'echo', 'echo-web', 'echo-service'] as const;
 export type ManagedScope = (typeof MANAGED_SCOPES)[number];
 
 export function isManagedScope(app: string): app is ManagedScope {
@@ -166,19 +166,19 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       'Read-only UISP CRM App Key. Used by applications to look up ' +
       'subscriber records when provisioning accounts.',
   },
-  // ── Read by EchoService, in the 'service' scope ────────────────────────────
+  // ── Read by EchoService, in the 'echo-service' scope ────────────────────────────
   {
     key: 'WEBHOOK_BASIC_USER',
     description:
-      'Basic-auth username carriers present on /webhooks/*. Callers inside trustedCIDR ' +
+      'Basic-auth username carriers present on /v1/{bandwidth,tychron}/*. Callers inside trustedCIDR ' +
       'are admitted without it. WARNING: leaving BOTH this and WEBHOOK_BASIC_PASS blank ' +
-      'disables basic auth entirely, leaving trustedCIDR as the only check on endpoints ' +
+      'disables authentication for external callers on endpoints ' +
       'that write inbound messages.',
   },
   {
     key: 'WEBHOOK_BASIC_PASS',
     description:
-      'Basic-auth password for /webhooks/*. Rotating it takes effect within 30 seconds, ' +
+      'Basic-auth password for /v1/{bandwidth,tychron}/*. Rotating it takes effect within 30 seconds, ' +
       'with no restart. Bandwidth reaches Echo from outside the trusted network, so this ' +
       'is the real control for it.',
   },
@@ -192,8 +192,18 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       "Bandwidth's own API base, deployment-wide. Defaults to " +
       'https://messaging.bandwidth.com/api/v2 when blank. Not a credential and not ' +
       'per-carrier: account credentials belong to the carrier application.',
-  }
+  },
+  { key: 'TYCHRON_SMS_URL', description: 'Platform SMS send endpoint; defaults to https://sms.tychron.online/sms.' },
+  { key: 'TYCHRON_MMS_URL', description: 'Platform MMS send endpoint; defaults to https://mms.tychron.online/api/v1/mms.' },
 ];
+
+/** The console offers empty fields without persisting empty rows. */
+function defaultScope(key: string): ManagedScope {
+  if (key === 'trustedCIDR' || key === 'PARENT_DOMAIN') return '*';
+  if (['WEBHOOK_BASIC_USER', 'WEBHOOK_BASIC_PASS', 'CORS_ORIGINS',
+    'BANDWIDTH_MESSAGING_API_BASE_URL', 'TYCHRON_SMS_URL', 'TYCHRON_MMS_URL'].includes(key)) return 'echo-service';
+  return 'identity';
+}
 
 export type Settings = Record<string, string>;
 
@@ -334,6 +344,7 @@ interface ResolvedIds {
 }
 
 export class SettingsStore {
+  private static writes: Promise<void> = Promise.resolve();
   private ids: { at: number; ids: ResolvedIds } | null = null;
   private cache: { at: number; settings: Settings } | null = null;
 
@@ -463,8 +474,8 @@ export class SettingsStore {
   }
 
   /**
-   * Create the base and table if they are missing, and seed every known key
-   * so the admin never has to guess what goes in the table.
+   * Create the base and table if missing. The admin catalog supplies empty fields
+   * without writing blank rows.
    *
    * This is the one path allowed to create the base — everywhere else a
    * missing base is an error, because a second base appearing by accident is
@@ -524,30 +535,14 @@ export class SettingsStore {
         ));
       this.ids = { at: Date.now(), ids: { baseId: base.id, tableId: table.id } };
 
-      // Seed missing keys so the full settings menu is visible. Values are
-      // left EMPTY — a table being created for the first time is not the
-      // place to invent a public URL or a domain, and an environment
-      // override is not copied in either: it would be a snapshot that goes
-      // stale the moment the environment changed. The setup wizard fills
-      // these in from the URL the first admin actually reached this app on.
-      const rows = await this.listRows();
-      const present = new Set(rows.filter(r => r.app === SETTINGS_SCOPE).map((r) => r.settingKey));
-      const missing = KNOWN_SETTINGS.filter((s) => !present.has(s.key));
-      if (missing.length) {
-        // v2 records POST accepts an array for bulk insert.
-        await this.api(
-          'POST',
-          `/api/v2/tables/${table.id}/records`,
-          missing.map((s) => ({ app: SETTINGS_SCOPE, settingKey: s.key, settingValue: '', description: s.description, bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(s.key) }))
-        );
-      }
+
     } catch (err) {
       this.ids = null;
       throw this.asUnavailable(err);
     }
   }
 
-  private async listRows(): Promise<NocoTableRow[]> {
+  private async listRows(validateDuplicates = true): Promise<NocoTableRow[]> {
     const { tableId } = await this.resolveIds();
     try {
       const out: NocoTableRow[] = [];
@@ -561,11 +556,16 @@ export class SettingsStore {
         if (page.list.length < 200 || page.pageInfo?.isLastPage === true) break;
         offset += 200;
       }
-      const seen = new Set<string>();
-      for (const row of out) {
-        const key = JSON.stringify([row.app, row.settingKey]);
-        if (seen.has(key)) throw new SettingsUnavailableError('duplicate', `Duplicate setting for scope ${row.app} and key ${row.settingKey}`);
-        seen.add(key);
+      if (validateDuplicates) {
+        const groups = new Map<string, NocoTableRow[]>();
+        for (const row of out) {
+          const key = JSON.stringify([row.app, row.settingKey]);
+          groups.set(key, [...(groups.get(key) || []), row]);
+        }
+        const duplicates = [...groups.values()].filter((group) => group.length > 1);
+        if (duplicates.length) throw new SettingsUnavailableError('duplicate',
+          'Duplicate settings: ' + duplicates.map((group) =>
+            `${group[0].app}/${group[0].settingKey} (rows ${group.map((row) => row.Id).join(', ')})`).join('; '));
       }
       return out;
     } catch (err) {
@@ -595,6 +595,24 @@ export class SettingsStore {
     return settings;
   }
 
+  /** Read-only integrity report: no secret values, including when runtime reads fail. */
+  async audit() {
+    const rows = await this.listRows(false);
+    const groups = new Map<string, NocoTableRow[]>();
+    for (const row of rows) {
+      const key = JSON.stringify([String(row.app).trim().toLowerCase(), String(row.settingKey).trim().toLowerCase()]);
+      groups.set(key, [...(groups.get(key) || []), row]);
+    }
+    return {
+      duplicates: [...groups.values()].filter((group) => group.length > 1).map((group) => ({
+        app: group[0].app, key: group[0].settingKey, rowIds: group.map((row) => row.Id),
+      })),
+      blankRows: rows.filter((row) => !String(row.settingValue ?? '').trim()).map((row) => ({
+        app: row.app, key: row.settingKey, rowId: row.Id,
+      })),
+    };
+  }
+
   async get(key: string): Promise<string | undefined> {
     return (await this.getAll())[key];
   }
@@ -610,7 +628,7 @@ export class SettingsStore {
     const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
 
     // One entry per (scope, key). Rows are NOT collapsed to an effective
-    // value any more: a `service` row and an `identity` row of the same name
+    // value any more: an `echo-service` row and an `identity` row of the same name
     // are different settings read by different applications, and showing only
     // the winner would hide the one the operator came to edit.
     const items: AdminSetting[] = rows
@@ -649,11 +667,24 @@ export class SettingsStore {
         source: 'environment',
       });
     }
+    for (const def of KNOWN_SETTINGS) {
+      const app = defaultScope(def.key);
+      if (items.some((item) => item.app === app && item.key === def.key)) continue;
+      items.push({ key: def.key, app, value: '', hasValue: false,
+        secret: isSecretKey(def.key), description: def.description, source: 'store' });
+    }
     return items.sort((a, b) => a.app.localeCompare(b.app) || a.key.localeCompare(b.key));
   }
 
   /** Write a key to the store. Refused when the environment pins it. */
   async set(key: string, value: string, app: string = SETTINGS_SCOPE): Promise<void> {
+    // Serialize Identity writes so two concurrent creates cannot both see an absent row.
+    const operation = SettingsStore.writes.then(() => this.write(key, value, app));
+    SettingsStore.writes = operation.catch(() => {});
+    return operation;
+  }
+
+  private async write(key: string, value: string, app: string): Promise<void> {
     if (!isManagedScope(app)) throw new SettingScopeError(app);
     if (!isConsoleManaged(key)) throw new SettingUnmanagedError(key);
     // The store's own rule, enforced rather than just documented: a secret in
@@ -664,7 +695,9 @@ export class SettingsStore {
     const { tableId } = await this.resolveIds();
     const rows = await this.listRows();
     const existing = rows.find((r) => r.app === app && r.settingKey === key);
-    if (existing) {
+    if (!value.trim()) {
+      if (existing) await this.api('DELETE', `/api/v2/tables/${tableId}/records`, [{ Id: existing.Id }]);
+    } else if (existing) {
       await this.api('PATCH', `/api/v2/tables/${tableId}/records`, [
         { Id: existing.Id, settingValue: value },
       ]);

@@ -696,7 +696,7 @@ describe('/admin config and the environment', () => {
     const res = await request(app)
       .put('/api/admin/config/BANDWIDTH_API_TOKEN')
       .set('Cookie', `identity_sso=${session}`)
-      .send({ value: 'legacy', app: 'service' });
+      .send({ value: 'legacy', app: 'echo-service' });
     expect(res.status).toBe(400);
     expect(res.body.error).toContain('carrier application');
     expect(fake.settings.BANDWIDTH_API_TOKEN).toBeUndefined();
