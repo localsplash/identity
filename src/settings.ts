@@ -70,7 +70,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'PARENT_DOMAIN',
     description:
-      'Apex domain (X.TLD) that all participating apps live under, e.g. wisp.net. ' +
+      'Apex domain (X.TLD) that all participating apps live under, e.g. X.TLD. ' +
       'Drives the SSO cookie scope and the redirect_uri allowlist (any https host ' +
       'under this domain). This is where the applications live; where the ' +
       'identities come from is SUPERADMIN_DOMAIN, which defaults to this but is ' +
@@ -79,7 +79,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'APP_BASE_URL',
     description:
-      'Public base URL of this identity app, e.g. https://identity.wisp.net. Used to ' +
+      'Public base URL of this identity app, e.g. https://identity.X.TLD. Used to ' +
       'build the OAuth callback URIs registered with each provider. Leave it empty ' +
       'and the URL the browser reached this service on is used instead — the setup ' +
       'wizard writes exactly that, so it normally never has to be typed.',
@@ -135,7 +135,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     description:
       'Where to send a user who signs in without a pending application request ' +
       '(e.g. entering straight from the UISP portal), such as ' +
-      'https://echo.wisp.net/auth/callback. Empty = show the account page.',
+      'https://echo.X.TLD/auth/callback. Empty = show the account page.',
   },
   { key: 'GOOGLE_CLIENT_ID', description: 'Google OAuth 2.0 client ID.' },
   { key: 'GOOGLE_CLIENT_SECRET', description: 'Google OAuth 2.0 client secret.' },
@@ -159,7 +159,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       "The UISP bridge plugin's public URL (UCRM generates it at install time). The " +
       'ISP login button is hidden until this is set.',
   },
-  { key: 'UISP_BASE_URL', description: 'UISP instance base URL, e.g. https://my.wisp.net.' },
+  { key: 'UISP_BASE_URL', description: 'UISP instance base URL, e.g. https://my.X.TLD.' },
   {
     key: 'UISP_CRM_APP_KEY_READ',
     description:
