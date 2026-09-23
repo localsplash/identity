@@ -95,7 +95,7 @@ remain the active authority. Keep deployment evidence, not duplicate authorities
   obsolete legacy stores directly; it does not require copying their data.
 
 The active repositories are Identity, AidaAdmin, OfficePulseAidaIntegration,
-EchoOrchestrator, EchoDatabase, EchoWeb, EchoService and EchoMedia. AidaHandset and
+EchoDatabase, EchoDatabase, EchoWeb, EchoService and EchoMedia. AidaHandset and
 AidaAgent are deferred. `delme_AidaControl` and AidaOfficePbxAdmin (being retired as
 `delme_AidaOfficePbxAdmin`) are excluded. AidaOfficePbxAdmin is not a separate new
 application. AidaInfrastructureSetupInstructions is historical documentation,
