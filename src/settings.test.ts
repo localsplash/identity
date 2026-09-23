@@ -325,12 +325,12 @@ describe('PlatformConfig scope contract',()=>{
     // Collapsing to the winner hid the one the operator came to edit.
     scoped([
       {Id:1,app:'identity',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'},
-      {Id:2,app:'service',settingKey:'CORS_ORIGINS',settingValue:'https://echo.x.tld'},
-      {Id:3,app:'service',settingKey:'WEBHOOK_BASIC_PASS',settingValue:'hunter2'},
+      {Id:2,app:'echo-service',settingKey:'CORS_ORIGINS',settingValue:'https://echo.x.tld'},
+      {Id:3,app:'echo-service',settingKey:'WEBHOOK_BASIC_PASS',settingValue:'hunter2'},
     ]);
     const items=await new SettingsStore(config,{}).listForAdmin();
-    const service=items.filter(i=>i.app==='service');
-    expect(service.map(i=>i.key).sort()).toEqual(['CORS_ORIGINS','WEBHOOK_BASIC_PASS']);
+    const service=items.filter(i=>i.app==='echo-service');
+    expect(service.filter(i=>i.hasValue).map(i=>i.key).sort()).toEqual(['CORS_ORIGINS','WEBHOOK_BASIC_PASS']);
     // WEBHOOK_BASIC_PASS carries PASS, not PASSWORD — the earlier pattern
     // missed it, so the webhook credential was not treated as a secret.
     const pass=service.find(i=>i.key==='WEBHOOK_BASIC_PASS');
@@ -341,9 +341,9 @@ describe('PlatformConfig scope contract',()=>{
     // listForAdmin reads rows from the store, so an existing row would still
     // have been offered for editing, just undescribed.
     scoped([
-      {Id:1,app:'service',settingKey:'BANDWIDTH_API_TOKEN',settingValue:'legacy'},
-      {Id:2,app:'service',settingKey:'BANDWIDTH_MESSAGING_API_BASE_URL',settingValue:'https://sandbox'},
-      {Id:3,app:'service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier'},
+      {Id:1,app:'echo-service',settingKey:'BANDWIDTH_API_TOKEN',settingValue:'legacy'},
+      {Id:2,app:'echo-service',settingKey:'BANDWIDTH_MESSAGING_API_BASE_URL',settingValue:'https://sandbox'},
+      {Id:3,app:'echo-service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier'},
     ]);
     const keys=(await new SettingsStore(config,{}).listForAdmin()).map(i=>i.key);
     expect(keys).not.toContain('BANDWIDTH_API_TOKEN');
@@ -353,16 +353,16 @@ describe('PlatformConfig scope contract',()=>{
   });
   it('refuses to write a carrier-application credential',async()=>{
     scoped([]);
-    await expect(new SettingsStore(config,{}).set('BANDWIDTH_API_SECRET','x','service'))
+    await expect(new SettingsStore(config,{}).set('BANDWIDTH_API_SECRET','x','echo-service'))
       .rejects.toMatchObject({name:'SettingUnmanagedError'});
     expect(vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST')).toBeUndefined();
   });
   it('writes to the scope it was given, not always its own',async()=>{
     scoped([]);
-    await new SettingsStore(config,{}).set('WEBHOOK_BASIC_USER','carrier','service');
+    await new SettingsStore(config,{}).set('WEBHOOK_BASIC_USER','carrier','echo-service');
     const write=vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST');
     expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({
-      app:'service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier',
+      app:'echo-service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier',
     });
   });
   it('refuses a secret in global scope, where every app can read it',async()=>{
@@ -376,9 +376,9 @@ describe('PlatformConfig scope contract',()=>{
     // EchoService reads, so it must not veto a service-scoped write.
     scoped([]);
     await new SettingsStore(config,{CORS_ORIGINS:'https://pinned.here'})
-      .set('CORS_ORIGINS','https://echo.x.tld','service');
+      .set('CORS_ORIGINS','https://echo.x.tld','echo-service');
     const write=vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST');
-    expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({app:'service'});
+    expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({app:'echo-service'});
   });
   it('never updates a global row when writing an identity override',async()=>{
     scoped([{Id:1,app:'*',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'}]);
@@ -386,5 +386,69 @@ describe('PlatformConfig scope contract',()=>{
     const calls=vi.mocked(fetch).mock.calls;
     const write=calls.find(([,init])=>init?.method==='POST');
     expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({app:'identity',settingKey:'PARENT_DOMAIN',settingValue:'new.tld'});
+  });
+});
+
+describe('PlatformConfig write integrity', () => {
+  function mutable(rows: Array<Record<string, unknown>>) {
+    const writes: Array<{ method: string; body: any }> = [];
+    vi.stubGlobal('fetch', vi.fn(async (url: string, init?: RequestInit) => {
+      const method = init?.method || 'GET';
+      const body = init?.body ? JSON.parse(String(init.body)) : null;
+      let value: unknown;
+      if (url.endsWith('/meta/bases')) value = { list: [{ id: 'b', title: SETTINGS_BASE_NAME }] };
+      else if (url.endsWith('/tables')) value = { list: [{ id: 't', title: SETTINGS_TABLE_NAME }] };
+      else if (method === 'GET') value = { list: rows.map((row) => ({ ...row })), pageInfo: { isLastPage: true } };
+      else {
+        writes.push({ method, body });
+        if (method === 'POST') rows.push({ Id: rows.length + 1, ...body });
+        if (method === 'PATCH') Object.assign(rows.find((row) => row.Id === body[0].Id)!, body[0]);
+        if (method === 'DELETE') rows.splice(rows.findIndex((row) => row.Id === body[0].Id), 1);
+        value = {};
+      }
+      return { ok: true, json: async () => value } as Response;
+    }));
+    return writes;
+  }
+
+  it('serializes concurrent creates into one insert and one update, even across stores', async () => {
+    const rows: Array<Record<string, unknown>> = [];
+    const writes = mutable(rows);
+    await Promise.all([
+      new SettingsStore(config, {}).set('WEBHOOK_BASIC_USER', 'first', 'echo-service'),
+      new SettingsStore(config, {}).set('WEBHOOK_BASIC_USER', 'second', 'echo-service'),
+    ]);
+    expect(writes.map((write) => write.method)).toEqual(['POST', 'PATCH']);
+    expect(rows).toHaveLength(1);
+    expect(rows[0].settingValue).toBe('second');
+  });
+
+  it('deletes blanked rows and never inserts missing blank rows or bootstrap seeds', async () => {
+    const rows = [{ Id: 82, app: 'identity', settingKey: 'WEBHOOK_BASIC_USER', settingValue: '' }];
+    const writes = mutable(rows);
+    const store = new SettingsStore(config, {});
+    await store.set('WEBHOOK_BASIC_USER', '   ');
+    await store.set('WEBHOOK_BASIC_PASS', '');
+    await store.bootstrap();
+    expect(writes).toEqual([{ method: 'DELETE', body: [{ Id: 82 }] }]);
+    expect(rows).toEqual([]);
+    const catalog = await store.listForAdmin();
+    expect(catalog.find((item) => item.key === 'WEBHOOK_BASIC_PASS')).toMatchObject({ app: 'echo-service', hasValue: false, secret: true });
+  });
+
+  it('reports every colliding row without values and refuses writes into duplicates', async () => {
+    const writes = mutable([
+      { Id: 1, app: 'identity', settingKey: 'DB_PASSWORD', settingValue: 'secret-one' },
+      { Id: 7, app: 'identity', settingKey: 'DB_PASSWORD', settingValue: 'secret-two' },
+      { Id: 83, app: 'identity', settingKey: 'WEBHOOK_BASIC_PASS', settingValue: '' },
+    ]);
+    const store = new SettingsStore(config, {});
+    await expect(store.getAll()).rejects.toThrow('identity/DB_PASSWORD (rows 1, 7)');
+    await expect(store.set('DB_PASSWORD', 'replacement')).rejects.toMatchObject({ reason: 'duplicate' });
+    const report = await store.audit();
+    expect(report.duplicates).toEqual([{ app: 'identity', key: 'DB_PASSWORD', rowIds: [1, 7] }]);
+    expect(report.blankRows).toEqual([{ app: 'identity', key: 'WEBHOOK_BASIC_PASS', rowId: 83 }]);
+    expect(JSON.stringify(report)).not.toContain('secret-');
+    expect(writes).toEqual([]);
   });
 });
