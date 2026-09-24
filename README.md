@@ -198,16 +198,25 @@ user entered straight from the portal.
 
 ## Installing
 
+**On a platform** (the shared MySQL and NocoDB from
+[AidaPlatformDB](https://github.com/localsplash/AidaPlatformDB)):
+`AidaPlatformDB/install.sh apps` clones this repo, writes `.env`
+(`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`), creates the `identity` MySQL account,
+seeds the rows and starts `compose.yaml`. By hand it is the same three things:
+`.env` from `.env.example`, `scripts/db-users.sh` against the shared MySQL, and
+`docker compose up -d --build` with the `BUILD_*` stamps exported. Then open
+`/setup` in a browser to claim the instance.
+
+**Self-contained** (development, or a throwaway instance with a MySQL of its
+own):
+
 ```bash
-scripts/install.sh      # generates the DB passwords, brings everything up
+scripts/install.sh      # generates the DB passwords, brings compose.dev.yaml up
 ```
 
-Then open the service in a browser and follow `/setup`. That is the whole
-installation: nothing else is edited by hand.
-
-Identity owns its data. `docker-compose.yml` brings up its own MySQL on a
-private network — not published, not shared — and this app applies its own
-schema to it. The only thing it expects to already exist is a NocoDB.
+Then open the service in a browser and follow `/setup`, which also asks for
+the bundled database's coordinates (host `db`). Identity applies its own
+schema either way; the only thing it expects to already exist is a NocoDB.
 
 ### On a shared MySQL
 
@@ -242,24 +251,27 @@ first-run wizard collects them:
 | --- | --- | --- |
 | NocoDB URL | `/data/config.json` | It is where the settings are |
 | NocoDB API token | `/data/config.json` | It is how they are read |
-| `trustedCIDR` | `auth_tbl_Settings` | Required before anything is admitted; the row itself is platform-wide, so it goes to the store like every other setting |
+| `trustedCIDR` | `cfg_tbl_Setting` | Required before anything is admitted; the row itself is platform-wide, so it goes to the store like every other setting |
 
 `/data` is the `identity-config` volume, so an instance is set up once and
 survives rebuilds. Both NocoDB values may instead be stated in `.env`, where
 they win and the wizard skips step 1.
 
 Everything else — the trusted network, the public URL, the OAuth
-credentials — is a row in the **`auth_tbl_Settings`** table of the
-**`IdentityBase`** base in NocoDB at `nocodb.X.TLD`. The MySQL coordinates
-come from `docker-compose.yml` and are not asked about at all.
+credentials — is a row in the **`cfg_tbl_Setting`** table of the
+**`PlatformConfig`** base in NocoDB at `nocodb.X.TLD`, in the `identity`
+scope (or `*` for platform-wide keys such as `PARENT_DOMAIN` and
+`trustedCIDR`). The MySQL coordinates are rows too: `DB_HOST` derives
+`lsdb.<PARENT_DOMAIN>` when unset, and the wizard's database step asks for
+whatever is still missing.
 
 ### Naming
 
 | Thing | Rule | Here |
 | --- | --- | --- |
 | Public URL | `{repo}.X.TLD`, lowercase | `identity.X.TLD` |
-| NocoDB base | `{Repo}Base` | `IdentityBase` |
-| Settings table | `auth_tbl_Settings` | `auth_tbl_Settings` |
+| NocoDB base | `PlatformConfig`, shared by every application | `PlatformConfig` |
+| Settings table | `cfg_tbl_Setting`, one `app` scope per application | `cfg_tbl_Setting` |
 
 The short form `id` is retired: it reads as "identifier" everywhere it
 appears, which is genuinely ambiguous in an application whose primary key is
@@ -290,7 +302,7 @@ A change made in NocoDB reaches a running instance **without a restart**:
 ### Failure is loud
 
 There is no fallback. If NocoDB is unreachable, the token is rejected, or no
-base named `IdentityBase` exists:
+base named `PlatformConfig` exists:
 
 - **at startup** the app retries once after 5 seconds, then exits non-zero
   naming the URL, the base and which of the three it was;
@@ -360,13 +372,13 @@ claiming it.
    where every application reads it, and the service restarts into them.
    Skipped entirely when `.env` already states the NocoDB values.
 
-   There is no step for the identity database. It is the MySQL in
-   `docker-compose.yml`, and the app migrates it itself.
+   The database step asks for `platform_db`'s coordinates only when no row
+   answers (`DB_HOST` derives `lsdb.<PARENT_DOMAIN>`); the app migrates it
+   itself.
 2. The wizard fills in this service's public URL from the browser's own
    address bar and the application domain from that host minus its label
    (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
-   server-side, and both fixed and read-only when the environment pins
-   them. The admin confirms the application domain (`X.TLD`) and enters
+   server-side. The admin confirms the application domain (`X.TLD`) and enters
    credentials for **Google or Microsoft** (the wizard is limited to
    providers that can prove a domain; Microsoft additionally requires a
    tenant ID — `common` cannot prove anything). In production the service
@@ -375,7 +387,7 @@ claiming it.
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.
 4. Only if the sign-in works **and** the verified account is on the Super
-   Admin domain does the wizard persist everything to `auth_tbl_Settings` (also
+   Admin domain does the wizard persist everything to `cfg_tbl_Setting` (also
    minting `IDENTITY_CLIENT_SECRET`), make the claimer Super System Admin, and
    land them on `/admin`. A failed or off-domain attempt saves nothing.
 5. If the sign-in works but the account is on a *different* domain, the
@@ -389,7 +401,7 @@ changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
 
 To start over, remove the `identity-config` volume (the app forgets where
 its settings are and step 1 returns) and clear the provider rows in
-`auth_tbl_Settings` (the instance becomes unclaimed again).
+`cfg_tbl_Setting` (the instance becomes unclaimed again).
 
 ## Super System Admin
 
@@ -398,7 +410,7 @@ domain is one of `SUPERADMIN_DOMAIN` (default: `PARENT_DOMAIN`). Only
 providers that cryptographically vouch for the domain qualify — Google
 (Workspace `hd` / verified address) does; Microsoft only when the app is
 locked to a single tenant, since with a `common` authority any directory
-could assert any address. Admins can edit `auth_tbl_Settings`, inspect users and
+could assert any address. Admins can edit `cfg_tbl_Setting`, inspect users and
 identities, unlink identities (never a user's last one), and revoke
 sessions.
 
@@ -571,7 +583,7 @@ so no schema change is needed.
 
 Identity data lives in MySQL (the identity database) — the shared platform identity
 database on **LSAidaOffice01** — and **this repository is its sole schema
-owner**. There is no external schema source: `EchoDatabase/init` is not
+owner**. There is no external schema source: `AidaPlatformDB/echo/init` is not
 used and must not be. `identity_db.identity_tbl_User.iUserId` is the platform-wide
 person id; tenant, role, extension, and prompt data belong to the
 applications (e.g. Aida UID mappings in NocoDB), never as columns here.
@@ -609,11 +621,10 @@ users keep their `iUserId` and keep authenticating.
 To change the schema, append a new named migration; never edit, rename, or
 reorder a released one.
 
-**Local vs production.** `docker-compose.yml` / `.env.example` show how to
-point a dev instance at a disposable local MySQL (export `DB_HOST` and
-friends, or fill the rows in NocoDB once). Production is the shared
-the identity database on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
-live data at all times.
+**Local vs production.** `compose.dev.yaml` brings up a disposable MySQL
+beside the app and the wizard's database step points the instance at it.
+Production is the platform's shared MySQL (AidaPlatformDB), `DB_HOST` derived
+or set by a row — treat it as live data at all times.
 
 **Backup / restore / rollback (production).** Take a consistent dump
 before every deploy that includes a new migration:
@@ -638,8 +649,8 @@ npm test        # vitest
 npm run build   # tsc → dist/
 ```
 
-`docker-compose.yml` brings up this app and everything it owns. The only
-thing it expects to already exist is NocoDB.
+`compose.dev.yaml` brings up this app with a MySQL of its own; `compose.yaml`
+is the platform deployment. Both expect a NocoDB to already exist.
 
 ## Health version and Pacific timezone
 

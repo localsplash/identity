@@ -37,7 +37,7 @@ for the distinction between configured objects and runtime queue state.
 Queues are the selected call-distribution mechanism. A simultaneous `Dial()` to
 several endpoints is a ring group and must not be relabeled as a queue. Existing
 ring-group configuration needs an explicit, PBX-operated transition. No queue
-tables or vendor schema migrations belong in Identity or EchoDatabase.
+tables or vendor schema migrations belong in Identity or AidaPlatformDB/echo.
 
 There is no AidaAdmin-to-Asterisk desired-state synchronization workflow in this
 decision: no copied extension master, reconciliation jobs, retry dashboard, or
@@ -95,7 +95,7 @@ remain the active authority. Keep deployment evidence, not duplicate authorities
   obsolete legacy stores directly; it does not require copying their data.
 
 The active repositories are Identity, AidaAdmin, OfficePulseAidaIntegration,
-EchoDatabase, EchoDatabase, EchoWeb, EchoService and EchoMedia. AidaHandset and
+AidaPlatformDB, EchoWeb, EchoService and EchoMedia. AidaHandset and
 AidaAgent are deferred. `delme_AidaControl` and AidaOfficePbxAdmin (being retired as
 `delme_AidaOfficePbxAdmin`) are excluded. AidaOfficePbxAdmin is not a separate new
 application. AidaInfrastructureSetupInstructions is historical documentation,

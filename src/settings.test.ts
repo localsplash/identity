@@ -105,6 +105,16 @@ describe('SettingsStore', () => {
 });
 
 describe('database coordinates as settings', () => {
+  it('derives the platform MySQL host from PARENT_DOMAIN when no row names one', () => {
+    expect(
+      dbCoordinates({ PARENT_DOMAIN: 'wisp.net', DB_USER: 'identity', DB_NAME: 'platform_db' })
+    ).toMatchObject({ host: 'lsdb.wisp.net', port: 3306 });
+    expect(
+      dbCoordinates({ PARENT_DOMAIN: 'wisp.net', DB_HOST: 'mysql.internal', DB_USER: 'identity', DB_NAME: 'platform_db' })
+    ).toMatchObject({ host: 'mysql.internal' });
+    expect(dbCoordinates({ DB_USER: 'identity', DB_NAME: 'platform_db' })).toBeNull();
+  });
+
   it('reads the pool coordinates out of the settings', () => {
     expect(
       dbCoordinates({
