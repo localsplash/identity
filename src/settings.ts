@@ -52,7 +52,7 @@ export function isConsoleManaged(key: string): boolean {
  * Keys whose value must never be returned to a browser, and which may not be
  * written to the global `*` scope.
  *
- * WEBHOOK_BASIC_PASS is why this is not the narrower word list it looks like
+ * TYCHRON_WEBHOOK_BASIC_PASS is why this is not the narrower word list it looks like
  * it should be: it carries PASS, not PASSWORD, so the earlier pattern did not
  * match and the credential gating EchoService's webhooks would have been
  * stored unflagged.
@@ -167,21 +167,19 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       'subscriber records when provisioning accounts.',
   },
   // ── Read by EchoService, in the 'echo-service' scope ────────────────────────────
-  {
-    key: 'WEBHOOK_BASIC_USER',
-    description:
-      'Basic-auth username carriers present on /v1/{bandwidth,tychron}/*. Callers inside trustedCIDR ' +
-      'are admitted without it. WARNING: leaving BOTH this and WEBHOOK_BASIC_PASS blank ' +
-      'disables authentication for external callers on endpoints ' +
-      'that write inbound messages.',
-  },
-  {
-    key: 'WEBHOOK_BASIC_PASS',
-    description:
-      'Basic-auth password for /v1/{bandwidth,tychron}/*. Rotating it takes effect within 30 seconds, ' +
-      'with no restart. Bandwidth reaches Echo from outside the trusted network, so this ' +
-      'is the real control for it.',
-  },
+  ...['BANDWIDTH', 'TYCHRON'].flatMap((carrier) => [
+    {
+      key: `${carrier}_WEBHOOK_BASIC_USER`,
+      description: `${carrier} webhook Basic Auth username for /v1/${carrier.toLowerCase()}/*. ` +
+        `Callers inside trustedCIDR are admitted without it. Leaving both this and ` +
+        `${carrier}_WEBHOOK_BASIC_PASS blank disables authentication for this carrier.`,
+    },
+    {
+      key: `${carrier}_WEBHOOK_BASIC_PASS`,
+      description: `${carrier} webhook Basic Auth password. Changes take effect within 30 seconds ` +
+        `without a restart. Independent of other carriers and outbound API credentials.`,
+    },
+  ]),
   {
     key: 'CORS_ORIGINS',
     description: 'Comma-separated browser origins EchoService accepts. Deployment configuration.',
@@ -200,7 +198,8 @@ export const KNOWN_SETTINGS: SettingDef[] = [
 /** The console offers empty fields without persisting empty rows. */
 function defaultScope(key: string): ManagedScope {
   if (key === 'trustedCIDR' || key === 'PARENT_DOMAIN') return '*';
-  if (['WEBHOOK_BASIC_USER', 'WEBHOOK_BASIC_PASS', 'CORS_ORIGINS',
+  if (['BANDWIDTH_WEBHOOK_BASIC_USER', 'BANDWIDTH_WEBHOOK_BASIC_PASS',
+    'TYCHRON_WEBHOOK_BASIC_USER', 'TYCHRON_WEBHOOK_BASIC_PASS', 'CORS_ORIGINS',
     'BANDWIDTH_MESSAGING_API_BASE_URL', 'TYCHRON_SMS_URL', 'TYCHRON_MMS_URL'].includes(key)) return 'echo-service';
   return 'identity';
 }

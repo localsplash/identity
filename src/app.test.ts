@@ -683,7 +683,7 @@ describe('/admin config and the environment', () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
     const res = await request(app)
-      .put('/api/admin/config/WEBHOOK_BASIC_USER')
+      .put('/api/admin/config/TYCHRON_WEBHOOK_BASIC_USER')
       .set('Cookie', `identity_sso=${session}`)
       .send({ value: 'carrier', app: 'not-an-app' });
     expect(res.status).toBe(400);
@@ -706,7 +706,7 @@ describe('/admin config and the environment', () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
     const res = await request(app)
-      .put('/api/admin/config/WEBHOOK_BASIC_PASS')
+      .put('/api/admin/config/TYCHRON_WEBHOOK_BASIC_PASS')
       .set('Cookie', `identity_sso=${session}`)
       .send({ value: 'hunter2', app: '*' });
     expect(res.status).toBe(400);

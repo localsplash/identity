@@ -176,11 +176,11 @@ X-Id-Signature: sha256=&lt;hex&gt;
     // accepting two empty fields silently.
     function webhookAuthWarning(items) {
       const get = (k) => ['echo-service', 'echo', '*'].map((app) => items.find((i) => i.app === app && i.key === k && i.hasValue)).find(Boolean);
-      const user = get('WEBHOOK_BASIC_USER');
-      const pass = get('WEBHOOK_BASIC_PASS');
-      if ((user && user.hasValue) || (pass && pass.hasValue)) return '';
-      return 'Webhook basic auth is OFF — both WEBHOOK_BASIC_USER and WEBHOOK_BASIC_PASS are blank. '
-           + 'External carrier requests are unauthenticated until the credentials are configured.';
+      return ['BANDWIDTH', 'TYCHRON'].filter((carrier) =>
+        !get(`${carrier}_WEBHOOK_BASIC_USER`) && !get(`${carrier}_WEBHOOK_BASIC_PASS`)
+      ).map((carrier) => `${carrier} webhook basic auth is OFF — both ${carrier}_WEBHOOK_BASIC_USER ` +
+        `and ${carrier}_WEBHOOK_BASIC_PASS are blank. External ${carrier} callbacks are unauthenticated.`
+      ).join(' ');
     }
 
     async function loadConfig() {
