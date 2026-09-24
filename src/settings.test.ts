@@ -326,15 +326,20 @@ describe('PlatformConfig scope contract',()=>{
     scoped([
       {Id:1,app:'identity',settingKey:'PARENT_DOMAIN',settingValue:'x.tld'},
       {Id:2,app:'echo-service',settingKey:'CORS_ORIGINS',settingValue:'https://echo.x.tld'},
-      {Id:3,app:'echo-service',settingKey:'WEBHOOK_BASIC_PASS',settingValue:'hunter2'},
+      {Id:3,app:'echo-service',settingKey:'TYCHRON_WEBHOOK_BASIC_PASS',settingValue:'hunter2'},
     ]);
     const items=await new SettingsStore(config,{}).listForAdmin();
     const service=items.filter(i=>i.app==='echo-service');
-    expect(service.filter(i=>i.hasValue).map(i=>i.key).sort()).toEqual(['CORS_ORIGINS','WEBHOOK_BASIC_PASS']);
-    // WEBHOOK_BASIC_PASS carries PASS, not PASSWORD — the earlier pattern
+    expect(service.filter(i=>i.hasValue).map(i=>i.key).sort()).toEqual(['CORS_ORIGINS','TYCHRON_WEBHOOK_BASIC_PASS']);
+    // TYCHRON_WEBHOOK_BASIC_PASS carries PASS, not PASSWORD — the earlier pattern
     // missed it, so the webhook credential was not treated as a secret.
-    const pass=service.find(i=>i.key==='WEBHOOK_BASIC_PASS');
+    const pass=service.find(i=>i.key==='TYCHRON_WEBHOOK_BASIC_PASS');
     expect(pass).toMatchObject({secret:true,value:'',hasValue:true});
+    for (const carrier of ['BANDWIDTH', 'TYCHRON']) {
+      expect(service.find(i=>i.key===`${carrier}_WEBHOOK_BASIC_USER`)).toMatchObject({app:'echo-service',secret:false});
+      expect(service.find(i=>i.key===`${carrier}_WEBHOOK_BASIC_PASS`)).toMatchObject({app:'echo-service',secret:true,value:''});
+    }
+    expect(service.some(i=>['WEBHOOK_BASIC_USER','WEBHOOK_BASIC_PASS'].includes(i.key))).toBe(false);
   });
   it('hides carrier-application credentials even when rows exist for them',async()=>{
     // Dropping them from KNOWN_SETTINGS alone would only remove the help text:
@@ -343,13 +348,13 @@ describe('PlatformConfig scope contract',()=>{
     scoped([
       {Id:1,app:'echo-service',settingKey:'BANDWIDTH_API_TOKEN',settingValue:'legacy'},
       {Id:2,app:'echo-service',settingKey:'BANDWIDTH_MESSAGING_API_BASE_URL',settingValue:'https://sandbox'},
-      {Id:3,app:'echo-service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier'},
+      {Id:3,app:'echo-service',settingKey:'TYCHRON_WEBHOOK_BASIC_USER',settingValue:'carrier'},
     ]);
     const keys=(await new SettingsStore(config,{}).listForAdmin()).map(i=>i.key);
     expect(keys).not.toContain('BANDWIDTH_API_TOKEN');
     // The API base is deployment-wide, not per-carrier, so it stays.
     expect(keys).toContain('BANDWIDTH_MESSAGING_API_BASE_URL');
-    expect(keys).toContain('WEBHOOK_BASIC_USER');
+    expect(keys).toContain('TYCHRON_WEBHOOK_BASIC_USER');
   });
   it('refuses to write a carrier-application credential',async()=>{
     scoped([]);
@@ -359,15 +364,15 @@ describe('PlatformConfig scope contract',()=>{
   });
   it('writes to the scope it was given, not always its own',async()=>{
     scoped([]);
-    await new SettingsStore(config,{}).set('WEBHOOK_BASIC_USER','carrier','echo-service');
+    await new SettingsStore(config,{}).set('TYCHRON_WEBHOOK_BASIC_USER','carrier','echo-service');
     const write=vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST');
     expect(JSON.parse(String(write?.[1]?.body))).toMatchObject({
-      app:'echo-service',settingKey:'WEBHOOK_BASIC_USER',settingValue:'carrier',
+      app:'echo-service',settingKey:'TYCHRON_WEBHOOK_BASIC_USER',settingValue:'carrier',
     });
   });
   it('refuses a secret in global scope, where every app can read it',async()=>{
     scoped([]);
-    await expect(new SettingsStore(config,{}).set('WEBHOOK_BASIC_PASS','hunter2','*'))
+    await expect(new SettingsStore(config,{}).set('TYCHRON_WEBHOOK_BASIC_PASS','hunter2','*'))
       .rejects.toMatchObject({name:'SettingScopeError'});
     expect(vi.mocked(fetch).mock.calls.find(([,init])=>init?.method==='POST')).toBeUndefined();
   });
@@ -415,8 +420,8 @@ describe('PlatformConfig write integrity', () => {
     const rows: Array<Record<string, unknown>> = [];
     const writes = mutable(rows);
     await Promise.all([
-      new SettingsStore(config, {}).set('WEBHOOK_BASIC_USER', 'first', 'echo-service'),
-      new SettingsStore(config, {}).set('WEBHOOK_BASIC_USER', 'second', 'echo-service'),
+      new SettingsStore(config, {}).set('TYCHRON_WEBHOOK_BASIC_USER', 'first', 'echo-service'),
+      new SettingsStore(config, {}).set('TYCHRON_WEBHOOK_BASIC_USER', 'second', 'echo-service'),
     ]);
     expect(writes.map((write) => write.method)).toEqual(['POST', 'PATCH']);
     expect(rows).toHaveLength(1);
@@ -424,30 +429,30 @@ describe('PlatformConfig write integrity', () => {
   });
 
   it('deletes blanked rows and never inserts missing blank rows or bootstrap seeds', async () => {
-    const rows = [{ Id: 82, app: 'identity', settingKey: 'WEBHOOK_BASIC_USER', settingValue: '' }];
+    const rows = [{ Id: 82, app: 'identity', settingKey: 'TYCHRON_WEBHOOK_BASIC_USER', settingValue: '' }];
     const writes = mutable(rows);
     const store = new SettingsStore(config, {});
-    await store.set('WEBHOOK_BASIC_USER', '   ');
-    await store.set('WEBHOOK_BASIC_PASS', '');
+    await store.set('TYCHRON_WEBHOOK_BASIC_USER', '   ');
+    await store.set('TYCHRON_WEBHOOK_BASIC_PASS', '');
     await store.bootstrap();
     expect(writes).toEqual([{ method: 'DELETE', body: [{ Id: 82 }] }]);
     expect(rows).toEqual([]);
     const catalog = await store.listForAdmin();
-    expect(catalog.find((item) => item.key === 'WEBHOOK_BASIC_PASS')).toMatchObject({ app: 'echo-service', hasValue: false, secret: true });
+    expect(catalog.find((item) => item.key === 'TYCHRON_WEBHOOK_BASIC_PASS')).toMatchObject({ app: 'echo-service', hasValue: false, secret: true });
   });
 
   it('reports every colliding row without values and refuses writes into duplicates', async () => {
     const writes = mutable([
       { Id: 1, app: 'identity', settingKey: 'DB_PASSWORD', settingValue: 'secret-one' },
       { Id: 7, app: 'identity', settingKey: 'DB_PASSWORD', settingValue: 'secret-two' },
-      { Id: 83, app: 'identity', settingKey: 'WEBHOOK_BASIC_PASS', settingValue: '' },
+      { Id: 83, app: 'identity', settingKey: 'TYCHRON_WEBHOOK_BASIC_PASS', settingValue: '' },
     ]);
     const store = new SettingsStore(config, {});
     await expect(store.getAll()).rejects.toThrow('identity/DB_PASSWORD (rows 1, 7)');
     await expect(store.set('DB_PASSWORD', 'replacement')).rejects.toMatchObject({ reason: 'duplicate' });
     const report = await store.audit();
     expect(report.duplicates).toEqual([{ app: 'identity', key: 'DB_PASSWORD', rowIds: [1, 7] }]);
-    expect(report.blankRows).toEqual([{ app: 'identity', key: 'WEBHOOK_BASIC_PASS', rowId: 83 }]);
+    expect(report.blankRows).toEqual([{ app: 'identity', key: 'TYCHRON_WEBHOOK_BASIC_PASS', rowId: 83 }]);
     expect(JSON.stringify(report)).not.toContain('secret-');
     expect(writes).toEqual([]);
   });
