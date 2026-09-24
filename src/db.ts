@@ -28,8 +28,14 @@ export interface DbCoordinates {
  * registered port, which is the protocol's default and not a guess about
  * this deployment.
  */
+/** The platform convention for the shared MySQL, used when no row names a host. */
+export function derivedDbHost(settings: Settings): string {
+  const parent = (settings.PARENT_DOMAIN ?? '').trim();
+  return parent ? `lsdb.${parent}` : '';
+}
+
 export function dbCoordinates(settings: Settings): DbCoordinates | null {
-  const host = (settings.DB_HOST ?? '').trim();
+  const host = (settings.DB_HOST ?? '').trim() || derivedDbHost(settings);
   const user = (settings.DB_USER ?? '').trim();
   const database = (settings.DB_NAME ?? '').trim();
   if (!host || !user || !database) return null;
@@ -46,9 +52,9 @@ export function dbCoordinates(settings: Settings): DbCoordinates | null {
 export class DatabaseNotConfiguredError extends Error {
   constructor() {
     super(
-      'The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME ' +
-        '(and DB_PASSWORD) in the cfg_tbl_Setting settings table, or set them in ' +
-        "this app's environment, then restart."
+      'The platform_db coordinates are not set. Fill in DB_USER and DB_NAME (and ' +
+        'DB_PASSWORD; DB_HOST unless lsdb.<PARENT_DOMAIN> is right) in the ' +
+        'cfg_tbl_Setting settings table, then restart.'
     );
     this.name = 'DatabaseNotConfiguredError';
   }

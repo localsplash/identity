@@ -90,8 +90,9 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     key: 'DB_HOST',
     description:
       'Hostname of the MySQL server holding platform_db, the shared platform identity ' +
-      'database this app owns and migrates itself. Required — the app has no ' +
-      'sessions, users or identities until it is set. A change takes a restart.',
+      'database this app owns and migrates itself. Empty derives lsdb.<PARENT_DOMAIN>, ' +
+      'the platform convention; set it only where the server is named otherwise. ' +
+      'A change takes a restart.',
   },
   {
     key: 'DB_PORT',

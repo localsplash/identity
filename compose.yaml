@@ -1,0 +1,58 @@
+# Identity on a platform host: builds this checkout and joins the shared
+# networks. Every setting is a PlatformConfig row; .env states only how to
+# reach the store (NOCODB_BASE_URL, NOCODB_API_TOKEN) and the process knobs
+# below. Deploy with `docker compose up -d --build` after exporting
+# BUILD_REVISION, BUILD_REVISION_SHORT, SOURCE_DATE_EPOCH and BUILD_DIRTY
+# (AidaPlatformDB/install.sh and docker-container-control do). For a
+# self-contained local instance with its own MySQL use compose.dev.yaml.
+name: identity
+
+services:
+  identity:
+    build:
+      context: .
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:-}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:-0}
+        BUILD_DIRTY: ${BUILD_DIRTY:-true}
+      labels:
+        org.opencontainers.image.revision: ${BUILD_REVISION:-}
+        org.opencontainers.image.source: https://github.com/localsplash/identity
+    image: identity-platform:${BUILD_REVISION_SHORT:-local}
+    container_name: identity
+    environment:
+      TZ: ${TZ:-America/Los_Angeles}
+      NODE_ENV: ${NODE_ENV:-production}
+      PORT: "3200"
+      NOCODB_BASE_URL: ${NOCODB_BASE_URL:?the PlatformConfig NocoDB URL, https://nocodb.X.TLD}
+      NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:?this service's own NocoDB token}
+      # How an application proves it may redeem a handoff code at /api/token.
+      # cidr trusts the socket peer inside trustedCIDR alone; applications that
+      # reach this service through the reverse proxy are not inside it, so the
+      # default is dual: the CIDR path first, then the shared
+      # IDENTITY_CLIENT_SECRET row. Narrow to cidr where the apps are inside.
+      IDENTITY_APP_AUTH_MODE: ${IDENTITY_APP_AUTH_MODE:-dual}
+    volumes:
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
+    ports:
+      # Loopback only, for health checks from the host; public traffic arrives
+      # through the reverse proxy as http://identity:3200.
+      - 127.0.0.1:13200:3200
+    networks:
+      - proxy    # the reverse proxy routes identity.X.TLD here
+      - platform # MySQL when it is on this host, and the other applications
+    logging:
+      driver: json-file
+      options:
+        max-size: 10m
+        max-file: "3"
+    restart: unless-stopped
+
+networks:
+  proxy:
+    name: ${PROXY_NETWORK:-npm_network}
+    external: true
+  platform:
+    name: ${PLATFORM_NETWORK:-platform-local}
+    external: true

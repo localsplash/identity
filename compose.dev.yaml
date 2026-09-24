@@ -1,14 +1,13 @@
-# Everything this service needs, in one file.
+# A self-contained local instance: this service plus a MySQL of its own, for
+# development or a throwaway install. A platform deployment uses compose.yaml
+# against the shared MySQL instead.
 #
-# Identity owns its data: the MySQL below is its own, on a private network,
-# and it applies its own schema to it. The only thing it expects to find
-# already running is a NocoDB, which holds the settings table every
-# application on the platform reads.
-#
-# Nothing here has to be filled in by hand. `scripts/install.sh` writes the
-# database passwords into .env once, and the first-run wizard at /setup
-# collects the NocoDB address, the API token and the trusted network from a
-# browser and saves them to the identity-config volume.
+# `scripts/install.sh` writes the database passwords into .env once and brings
+# this up. The first-run wizard at /setup then collects the NocoDB address,
+# the API token and the trusted network from a browser (saved to the
+# identity-config volume) and the database coordinates (host `db`).
+name: identity-dev
+
 services:
   identity:
     build:

@@ -173,8 +173,9 @@ export function buildApp() {
       return {
         state: "unconfigured",
         hint:
-          "The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME " +
-          `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, then restart.`,
+          "The platform_db coordinates are not set. Fill in DB_USER and DB_NAME (and " +
+          "DB_PASSWORD; DB_HOST unless lsdb.<PARENT_DOMAIN> is right) in the " +
+          `${SETTINGS_TABLE_NAME} table in NocoDB, then restart.`,
       };
     }
     try {

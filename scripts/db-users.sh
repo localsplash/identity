@@ -6,7 +6,7 @@
 #   identity   ALL PRIVILEGES on its own database (platform_db), because
 #              Identity applies its own schema at boot (src/migrations.ts).
 #
-# The standalone install (scripts/install.sh + docker-compose.yml) doesn't
+# The standalone install (scripts/install.sh + compose.dev.yaml) doesn't
 # need this: its private MySQL creates the same account with the same rights
 # from MYSQL_USER when the volume is first initialised.
 #
