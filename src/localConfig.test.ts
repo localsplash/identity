@@ -89,7 +89,7 @@ describe('applyLocalConfig', () => {
     const env: NodeJS.ProcessEnv = { NOCODB_BASE_URL: 'https://env.test', NOCODB_API_TOKEN: '  ' };
     applyLocalConfig(env, file);
     expect(env.NOCODB_BASE_URL).toBe('https://env.test');
-    // Blank counts as unset, the same rule the settings overrides use.
+    // Blank counts as unset.
     expect(env.NOCODB_API_TOKEN).toBe('file');
   });
 });

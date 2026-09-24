@@ -1,9 +1,11 @@
 import { AppConfig } from './config';
 
 /** PlatformConfig is discovered by unique name; runtime reads never bootstrap.
- * Resolution: nonblank environment override > identity > global '*'. Identity
- * has no shared parent scope. Blank seed rows are unset, duplicate scoped keys
- * are configuration errors, and secrets are never promoted to global scope. */
+ * Resolution: identity > global '*'. The environment cannot pin a row: two
+ * homes for one value meant a row could be edited with no effect and nothing
+ * on the host to say why. Identity has no shared parent scope. Blank seed rows
+ * are unset, duplicate scoped keys are configuration errors, and secrets are
+ * never promoted to global scope. */
 export const SETTINGS_BASE_NAME = 'PlatformConfig';
 export const SETTINGS_TABLE_NAME = 'cfg_tbl_Setting';
 export const SETTINGS_SCOPE = 'identity';
@@ -206,54 +208,6 @@ function defaultScope(key: string): ManagedScope {
 
 export type Settings = Record<string, string>;
 
-// ─── Environment overrides ────────────────────────────────────────────────────
-
-/**
- * Any known setting may be pinned in the environment, where it wins over the
- * store. This is the escape hatch for deployments that manage configuration
- * as environment (a Helm chart, a CI secret) and for bringing an instance up
- * before NocoDB exists at all; the zero-config path leaves all of it unset.
- *
- * Blank and whitespace-only values are ignored rather than treated as an
- * override of "" — an empty variable in a compose file means "not set here".
- */
-export function settingOverridesFromEnv(env: NodeJS.ProcessEnv = process.env): Settings {
-  const overrides: Settings = {};
-  const take = (key: string, from: string): void => {
-    if (key in overrides) return;
-    const raw = env[from];
-    if (typeof raw === 'string' && raw.trim() !== '') overrides[key] = raw.trim();
-  };
-  for (const { key } of KNOWN_SETTINGS) take(key, key);
-  // Environment-shaped spellings for keys whose canonical name is not, and
-  // the pre-rollout names kept working for one release.
-  for (const [key, names] of Object.entries(ENV_ALIASES)) {
-    for (const name of names) take(key, name);
-  }
-  return overrides;
-}
-
-/**
- * Environment names that pin a setting whose canonical key reads oddly as a
- * variable (`trustedCIDR`), plus the names this app used before `id` became
- * `identity`. First one set wins, canonical spelling first.
- */
-export const ENV_ALIASES: Record<string, string[]> = {
-  trustedCIDR: ['IDENTITY_TRUSTED_NETWORK', 'ID_TRUSTED_NETWORK', 'ID_TRUSTED_APP_CIDRS'],
-  IDENTITY_CLIENT_SECRET: ['ID_CLIENT_SECRET'],
-};
-
-/** Raised when a write targets a key the environment has pinned. */
-export class SettingOverriddenError extends Error {
-  constructor(public key: string) {
-    super(
-      `${key} is set in this app's environment, which overrides the settings ` +
-        'store. Change it there (and restart) or unset it to manage it here.'
-    );
-    this.name = 'SettingOverriddenError';
-  }
-}
-
 /** Raised when a write targets a key this console deliberately does not manage. */
 export class SettingUnmanagedError extends Error {
   constructor(public key: string) {
@@ -302,8 +256,6 @@ export class SettingsUnavailableError extends Error {
 }
 
 /** Where an effective value came from — surfaced to /admin and the wizard. */
-export type SettingSource = 'environment' | 'store';
-
 export interface AdminSetting {
   key: string;
   /** Which app reads this row. */
@@ -314,7 +266,6 @@ export interface AdminSetting {
   hasValue: boolean;
   secret: boolean;
   description: string;
-  source: SettingSource;
 }
 
 // ─── NocoDB v2 API client ─────────────────────────────────────────────────────
@@ -347,20 +298,7 @@ export class SettingsStore {
   private ids: { at: number; ids: ResolvedIds } | null = null;
   private cache: { at: number; settings: Settings } | null = null;
 
-  constructor(
-    private config: AppConfig,
-    private overrides: Settings = settingOverridesFromEnv()
-  ) {}
-
-  /** True when the environment pins this key, so the store cannot decide it. */
-  isOverridden(key: string): boolean {
-    return key in this.overrides;
-  }
-
-  /** The keys the environment is pinning, for logging and the admin UI. */
-  overriddenKeys(): string[] {
-    return Object.keys(this.overrides);
-  }
+  constructor(private config: AppConfig) {}
 
   private headers(): Record<string, string> {
     return {
@@ -576,9 +514,8 @@ export class SettingsStore {
   }
 
   /**
-   * All settings as a map, with the environment overriding the store. Cached
-   * briefly; empty values are omitted, so a blank row reads as "not set"
-   * rather than as an empty string that would shadow the override.
+   * All settings as a map. Cached briefly; empty values are omitted, so a
+   * blank row reads as "not set" rather than as an empty string.
    */
   async getAll(): Promise<Settings> {
     if (this.cache && Date.now() - this.cache.at < CACHE_TTL_MS) return this.cache.settings;
@@ -589,7 +526,6 @@ export class SettingsStore {
         settings[r.settingKey] = String(r.settingValue).trim();
       }
     }
-    Object.assign(settings, this.overrides);
     this.cache = { at: Date.now(), settings };
     return settings;
   }
@@ -616,15 +552,9 @@ export class SettingsStore {
     return (await this.getAll())[key];
   }
 
-  /**
-   * Rows including empty values and descriptions — for the admin UI. The
-   * effective value is reported, so a key the environment pins shows what is
-   * actually in force (tagged 'environment', and not editable) rather than
-   * the store row it is shadowing.
-   */
+  /** Rows including empty values and descriptions — for the admin UI. */
   async listForAdmin(): Promise<AdminSetting[]> {
     const rows = await this.listRows();
-    const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
 
     // One entry per (scope, key). Rows are NOT collapsed to an effective
     // value any more: an `echo-service` row and an `identity` row of the same name
@@ -634,10 +564,7 @@ export class SettingsStore {
       .filter((r) => r.settingKey && isManagedScope(r.app) && isConsoleManaged(r.settingKey))
       .map((r) => {
         const secret = isSecretKey(r.settingKey);
-        // Only this app's own environment can override a row, and only for
-        // its own scope. Another app's overrides are invisible from here.
-        const overridden = r.app === SETTINGS_SCOPE && this.isOverridden(r.settingKey);
-        const value = overridden ? this.overrides[r.settingKey] : String(r.settingValue ?? '');
+        const value = String(r.settingValue ?? '');
         return {
           key: r.settingKey,
           app: r.app,
@@ -645,37 +572,19 @@ export class SettingsStore {
           hasValue: value.trim() !== '',
           secret,
           description: r.description == null ? '' : String(r.description),
-          source: overridden ? ('environment' as const) : ('store' as const),
         };
       });
 
-    // An override for a key the store has no row for yet (NocoDB seeded
-    // before the key existed, or bootstrap has not run) is still in force —
-    // show it rather than letting it act invisibly.
-    const present = new Set(items.filter((i) => i.app === SETTINGS_SCOPE).map((i) => i.key));
-    for (const [key, value] of Object.entries(this.overrides)) {
-      if (present.has(key)) continue;
-      const secret = isSecretKey(key);
-      items.push({
-        key,
-        app: SETTINGS_SCOPE,
-        value: secret ? '' : value,
-        hasValue: String(value).trim() !== '',
-        secret,
-        description: described.get(key) ?? '',
-        source: 'environment',
-      });
-    }
     for (const def of KNOWN_SETTINGS) {
       const app = defaultScope(def.key);
       if (items.some((item) => item.app === app && item.key === def.key)) continue;
       items.push({ key: def.key, app, value: '', hasValue: false,
-        secret: isSecretKey(def.key), description: def.description, source: 'store' });
+        secret: isSecretKey(def.key), description: def.description });
     }
     return items.sort((a, b) => a.app.localeCompare(b.app) || a.key.localeCompare(b.key));
   }
 
-  /** Write a key to the store. Refused when the environment pins it. */
+  /** Write a key to the store. */
   async set(key: string, value: string, app: string = SETTINGS_SCOPE): Promise<void> {
     // Serialize Identity writes so two concurrent creates cannot both see an absent row.
     const operation = SettingsStore.writes.then(() => this.write(key, value, app));
@@ -689,8 +598,6 @@ export class SettingsStore {
     // The store's own rule, enforced rather than just documented: a secret in
     // '*' is readable by every application that can reach PlatformConfig.
     if (app === '*' && isSecretKey(key)) throw new SettingScopeError('*', key);
-    // Only this app's environment can shadow a row, and only in its own scope.
-    if (app === SETTINGS_SCOPE && this.isOverridden(key)) throw new SettingOverriddenError(key);
     const { tableId } = await this.resolveIds();
     const rows = await this.listRows();
     const existing = rows.find((r) => r.app === app && r.settingKey === key);

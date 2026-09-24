@@ -33,19 +33,11 @@ services:
       NOCODB_BASE_URL: ${NOCODB_BASE_URL:-}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
 
-      # This app's own database — the service below, not a shared one.
-      # These are pinned deliberately: the coordinates of a container in
-      # this same file are not something a wizard should be asking about.
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_USER: ${DB_USER:-identity}
-      DB_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
-      DB_NAME: ${DB_NAME:-platform_db}
+      # This app's own database is the `db` service below. Its coordinates
+      # are settings rows like everything else: the wizard's database step
+      # takes host `db`, user `identity`, database `platform_db` and the
+      # DB_PASSWORD scripts/install.sh generated in .env.
 
-      # Optional overrides of cfg_tbl_Setting rows. Blank counts as unset,
-      # so leaving these alone keeps the zero-config path: the public base
-      # URL is whatever URL the browser reached this service on, and the
-      # trusted network comes from the settings table.
       # How an application proves it may redeem a handoff code at /api/token.
       #
       # 'cidr' — the default — trusts the network allowlist alone, and never
@@ -58,9 +50,6 @@ services:
       # which is how EchoWeb authenticates. Narrow this back to 'cidr' if the
       # apps ever sit inside the trusted network.
       IDENTITY_APP_AUTH_MODE: ${IDENTITY_APP_AUTH_MODE:-dual}
-      IDENTITY_TRUSTED_NETWORK: ${IDENTITY_TRUSTED_NETWORK:-}
-      APP_BASE_URL: ${APP_BASE_URL:-}
-      PARENT_DOMAIN: ${PARENT_DOMAIN:-}
     volumes:
       # Holds config.json: the address of the settings store, and nothing
       # else. Survives a rebuild, so an instance is set up exactly once.

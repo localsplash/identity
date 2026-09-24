@@ -45,8 +45,6 @@
       <p class="text-xs text-slate-500 mb-4">
         Stored in NocoDB. A login method appears on the sign-in page only when all
         of its required keys are set. Values marked secret are write-only here.
-        A key tagged <span class="font-mono">env</span> is pinned in this app's
-        environment, which overrides the store — change it there and restart.
       </p>
       <div id="config" class="space-y-3"></div>
     </div>
@@ -154,7 +152,6 @@ X-Id-Signature: sha256=&lt;hex&gt;
       const origin = document.createElement('p');
       origin.className = 'text-[11px] text-slate-400 mt-1';
       const provenance = {
-        environment: ' — pinned by APP_BASE_URL in the environment',
         store: ' — from the APP_BASE_URL setting below',
         request: ' — the URL this console was reached on; set APP_BASE_URL below to pin it',
       }[source] || '';
@@ -213,13 +210,11 @@ X-Id-Signature: sha256=&lt;hex&gt;
         for (const row of items.filter((i) => i.app === scope)) {
           // The server decides what is a secret; it never sends those values.
           const secret = row.secret !== undefined ? row.secret : SECRET_RE.test(row.key);
-          const fromEnv = row.source === 'environment';
           const div = document.createElement('div');
           div.className = 'flex flex-col sm:flex-row sm:items-center gap-2 mb-2';
           div.innerHTML = `
             <div class="sm:w-64 flex-shrink-0">
               <span class="text-sm font-medium text-slate-700 font-mono">${esc(row.key)}</span>
-              ${fromEnv ? '<span class="ml-1 px-1.5 py-0.5 rounded bg-amber-100 text-amber-800 text-[10px] font-mono align-middle">env</span>' : ''}
               <span class="block text-[11px] text-slate-400 leading-tight">${esc(row.description || '')}</span>
             </div>`;
           const input = document.createElement('input');
@@ -229,17 +224,9 @@ X-Id-Signature: sha256=&lt;hex&gt;
             : (row.value ? '' : '(not set)');
           input.value = secret ? '' : row.value;
           input.className = 'flex-1 px-3 py-2 rounded-lg border border-slate-200 text-sm font-mono';
-          if (fromEnv) {
-            input.readOnly = true;
-            input.className += ' bg-slate-50 text-slate-500';
-            input.title = "Set in this app's environment; edit it there and restart.";
-          }
           const btn = document.createElement('button');
           btn.textContent = 'Save';
-          btn.className = fromEnv
-            ? 'px-3 py-2 rounded-lg bg-slate-200 text-slate-400 text-sm cursor-not-allowed'
-            : 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
-          btn.disabled = fromEnv;
+          btn.className = 'px-3 py-2 rounded-lg bg-slate-800 text-white text-sm hover:bg-slate-700';
           btn.onclick = async () => {
             // A blank secret field means "leave it alone", not "clear it" —
             // the value was never sent here, so an empty submit would wipe a

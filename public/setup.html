@@ -429,26 +429,14 @@
 
         const p = s.pending;
         const pinned = s.pinned || {};
-        const locked = s.locked || {};
 
-        // Anything already pinned (an environment override, or a row someone
-        // put in the settings store) wins; otherwise this page's own URL.
+        // A row already in the settings store wins; otherwise this page's own URL.
         const baseInput = document.getElementById('appBaseUrl');
         baseInput.value = pinned.appBaseUrl || BROWSER_BASE_URL;
-        if (locked.appBaseUrl) {
-          baseInput.readOnly = true;
-          baseInput.className += ' bg-slate-50 text-slate-500';
-          document.getElementById('appBaseUrlHint').textContent =
-            "APP_BASE_URL is set in this app's environment, so it is fixed here.";
-        }
 
         const domainInput = document.getElementById('parentDomain');
         domainInput.value =
           (p && p.parentDomain) || pinned.parentDomain || parentDomainFromHost(location.hostname);
-        if (locked.parentDomain) {
-          domainInput.readOnly = true;
-          domainInput.className += ' bg-slate-50 text-slate-500';
-        }
         if (p) {
           document.getElementById('clientId').value = p.clientId || '';
           document.getElementById('tenant').value = p.tenant || '';

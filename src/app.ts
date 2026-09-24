@@ -11,7 +11,6 @@ import {
   SettingsStore,
   Settings,
   SettingsUnavailableError,
-  SettingOverriddenError,
   SettingScopeError,
   SettingUnmanagedError,
   SETTINGS_BASE_NAME,
@@ -132,8 +131,7 @@ export function buildApp() {
   /**
    * The public base URL of this service, resolved per request:
    *
-   *   1. APP_BASE_URL — the environment override if there is one, otherwise
-   *      the settings row the wizard wrote;
+   *   1. APP_BASE_URL — the settings row the wizard wrote;
    *   2. the URL the browser actually reached us on (the proxy's forwarding
    *      headers when it sits in front, the socket's own Host otherwise) —
    *      the zero-config path, and always correct by construction;
@@ -176,8 +174,7 @@ export function buildApp() {
         state: "unconfigured",
         hint:
           "The platform_db coordinates are not set. Fill in DB_HOST, DB_USER, DB_NAME " +
-          `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, ` +
-          "or set them in this app's environment, then restart.",
+          `(and DB_PASSWORD) in the ${SETTINGS_TABLE_NAME} table in NocoDB, then restart.`,
       };
     }
     try {
@@ -553,9 +550,8 @@ export function buildApp() {
     // Deliberately no server-side guesses here. The wizard runs in the
     // browser that reached this service, and that browser's own URL is the
     // best available statement of where this service lives — better than
-    // anything reconstructed from headers. Only values that are already
-    // pinned are sent: an environment override (which the wizard must not
-    // let anyone contradict) or a row already in the store.
+    // anything reconstructed from headers. Only values already in the store
+    // are sent.
     return res.json({
       unclaimed: isUnclaimed(settings),
       step: "claim",
@@ -569,16 +565,10 @@ export function buildApp() {
         parentDomain: settings.PARENT_DOMAIN ?? "",
         trustedCIDR: settings.trustedCIDR ?? "",
       },
-      locked: {
-        appBaseUrl: settingsStore.isOverridden("APP_BASE_URL"),
-        parentDomain: settingsStore.isOverridden("PARENT_DOMAIN"),
-        trustedCIDR: settingsStore.isOverridden("trustedCIDR"),
-      },
       // The claim cannot complete while this is empty. Step 1 asks for it,
       // but an instance whose NocoDB address came from the environment never
       // saw step 1 — so the claim has to ask, or nothing ever would.
-      needsTrustedCIDR:
-        !settings.trustedCIDR && !settingsStore.isOverridden("trustedCIDR"),
+      needsTrustedCIDR: !settings.trustedCIDR,
       // The convention the wizard shows when it has to name an expected
       // shape ("identity.example.com") — the one default in this codebase.
       identityHostLabel: IDENTITY_HOST_LABEL,
@@ -662,12 +652,12 @@ export function buildApp() {
       }
 
       // Prove the address before saving it. A store built on the candidate
-      // values, with no environment overrides, so this tests exactly what
-      // the next boot will use.
-      const candidate = new SettingsStore(
-        { ...config, NOCODB_BASE_URL: nocodbBaseUrl, NOCODB_API_TOKEN: token },
-        {},
-      );
+      // values, so this tests exactly what the next boot will use.
+      const candidate = new SettingsStore({
+        ...config,
+        NOCODB_BASE_URL: nocodbBaseUrl,
+        NOCODB_API_TOKEN: token,
+      });
       try {
         await candidate.bootstrap();
       } catch (err) {
@@ -760,7 +750,6 @@ export function buildApp() {
         DB_PASSWORD: coords.password,
         DB_NAME: coords.database,
       })) {
-        if (settingsStore.isOverridden(key)) continue;
         await settingsStore.set(key, value);
       }
       settingsStore.invalidate();
@@ -784,8 +773,7 @@ export function buildApp() {
    * The browser sends its own origin, which is the whole point: the person
    * setting up is looking at the URL that has to work, so nothing has to be
    * guessed or typed. It is still validated — it ends up in the OAuth
-   * redirect_uri and in the settings store — and an environment override
-   * always wins over whatever arrives.
+   * redirect_uri and in the settings store.
    *
    * Returns the URL, or a message explaining why it cannot be used.
    */
@@ -796,18 +784,6 @@ export function buildApp() {
     parentDomain: string,
   ): { url: string } | { error: string } {
     const production = config.NODE_ENV === "production";
-    if (settingsStore.isOverridden("APP_BASE_URL")) {
-      const pinned = normalizeBaseUrl(settings.APP_BASE_URL ?? "", {
-        allowHttp: true,
-      });
-      return pinned
-        ? { url: pinned }
-        : {
-            error:
-              "APP_BASE_URL is set in this app's environment but is not a valid URL.",
-          };
-    }
-
     const raw = submitted.trim();
     const url = raw
       ? normalizeBaseUrl(raw, { allowHttp: !production })
@@ -875,13 +851,12 @@ export function buildApp() {
        * exactly that only refuses once the instance is already claimed,
        * which is one restart too late to be any help.
        *
-       * Only asked while it is missing: a value already in the store, or
-       * pinned in the environment, is left alone rather than offered up for
-       * an unauthenticated visitor to overwrite.
+       * Only asked while it is missing: a value already in the store is
+       * left alone rather than offered up for an unauthenticated visitor to
+       * overwrite.
        */
       const settingsTrustedCIDR = String(settings.trustedCIDR ?? "").trim();
-      const needsTrustedCIDR =
-        !settingsTrustedCIDR && !settingsStore.isOverridden("trustedCIDR");
+      const needsTrustedCIDR = !settingsTrustedCIDR;
       const trustedCIDR = needsTrustedCIDR
         ? String(body.trustedCIDR ?? "").trim() ||
           (inFlightTrustedCIDR(req) ?? "")
@@ -1096,9 +1071,6 @@ export function buildApp() {
     // exchange secret is minted here so apps have one from day one.
     await settingsStore.bootstrap();
     for (const [key, value] of Object.entries(candidate)) {
-      // A key the environment pins is already in force and is not the
-      // store's to hold — writing it would only create a stale copy.
-      if (settingsStore.isOverridden(key)) continue;
       await settingsStore.set(key, value);
     }
     if (!current.IDENTITY_CLIENT_SECRET) {
@@ -1810,14 +1782,10 @@ export function buildApp() {
         items: rows,
         providers: knownProviders,
         appBaseUrl: base,
-        // Empty when nothing pins APP_BASE_URL — the callback URLs above
-        // then follow the URL this console was reached on, which is what a
-        // zero-config instance runs on.
-        appBaseUrlSource: pinnedBase
-          ? settingsStore.isOverridden("APP_BASE_URL")
-            ? "environment"
-            : "store"
-          : "request",
+        // "request" when no APP_BASE_URL row is set — the callback URLs
+        // above then follow the URL this console was reached on, which is
+        // what a zero-config instance runs on.
+        appBaseUrlSource: pinnedBase ? "store" : "request",
         // Resolved rather than raw, so the list form and the PARENT_DOMAIN
         // fallback are both visible for what they are.
         superAdminDomains: superAdminDomains(settings),
@@ -1838,9 +1806,8 @@ export function buildApp() {
       if (!/^[A-Za-z0-9_.-]{1,128}$/.test(key)) {
         return res.status(400).json({ error: "Invalid key" });
       }
-      // The override and scope rules live in the store, which is the only
-      // place that knows both. An environment override is the deployment's
-      // decision, not this console's.
+      // The scope rules live in the store, which is the only place that
+      // knows them.
       const scope = String((req.body ?? {}).app ?? SETTINGS_SCOPE).trim();
       const value = String((req.body ?? {}).value ?? "");
       try {
@@ -1848,8 +1815,6 @@ export function buildApp() {
       } catch (err) {
         // A refused write is an answer, not a fault: say which rule stopped it
         // rather than letting it surface as a 500.
-        if (err instanceof SettingOverriddenError)
-          return res.status(409).json({ error: err.message });
         if (err instanceof SettingScopeError)
           return res.status(400).json({ error: err.message });
         if (err instanceof SettingUnmanagedError)
