@@ -49,10 +49,6 @@ async function main() {
       // Seeded rows are empty on purpose: a table being created for the
       // first time is not where a public URL or a domain gets invented. The
       // setup wizard fills those in from the URL the first admin arrives on.
-      const pinned = settingsStore.overriddenKeys();
-      if (pinned.length) {
-        console.log(`[settings] overridden by the environment: ${pinned.join(', ')}`);
-      }
       break;
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);

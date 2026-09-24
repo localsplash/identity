@@ -15,12 +15,9 @@ import { z } from 'zod';
  * runtime; a base ID in a config file is exactly the coupling the convention
  * exists to remove.
  *
- * Any of those rows may still be pinned in the environment:
- * `settingOverridesFromEnv()` reads every KNOWN_SETTINGS key (and the
- * environment-shaped aliases beside them) straight from process.env and
- * gives it precedence over the store. That is an override for deployments
- * that manage configuration as environment, not a default — nothing here
- * invents a value for something the deployment has not stated.
+ * None of those rows can be pinned in the environment: the store is the
+ * only source, so a row edited in NocoDB always takes effect (within the
+ * cache TTL, or after a restart for the database coordinates).
  *
  * APP_BASE_URL in particular needs no answer anywhere: left unset, the
  * public base URL is the URL the browser actually reached this service on
@@ -42,8 +39,7 @@ const envSchema = z.object({
   //
   // The network itself is NOT here: `trustedCIDR` is one setting for the
   // whole platform, read from PlatformConfig → cfg_tbl_Setting so every
-  // application spells the same network the same way. The environment may
-  // still pin it as IDENTITY_TRUSTED_NETWORK (see ENV_ALIASES).
+  // application spells the same network the same way.
   //
   // Which peers may speak for a client is not configured either: net.ts
   // reads X-Forwarded-For from private peers only, so a reverse proxy in

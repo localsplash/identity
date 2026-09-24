@@ -132,7 +132,7 @@ export function localConfigWritable(dir: string = LOCAL_CONFIG_DIR): boolean {
 /**
  * Fold the bootstrap file into an environment, without overriding anything
  * already stated there. Applied once at startup so that every later reader
- * — loadConfig, the settings overrides — sees one merged picture and none
+ * — loadConfig above all — sees one merged picture and none
  * of them has to know this file exists.
  */
 export function applyLocalConfig(

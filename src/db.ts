@@ -4,8 +4,8 @@ import { Settings } from './settings';
 /**
  * The MySQL pool for platform_db.
  *
- * Its coordinates are settings like any other — a row in `cfg_tbl_Setting`, or
- * an environment override — rather than a second configuration file. That
+ * Its coordinates are settings like any other — a row in `cfg_tbl_Setting` —
+ * rather than a second configuration file. That
  * means they are not known when the app is constructed, only when the
  * settings store is first read, so the pool is created lazily on first use.
  *

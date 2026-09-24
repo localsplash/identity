@@ -69,8 +69,7 @@ The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
 request only when the caller's resolved IPv4 peer is inside
 `trustedCIDR` — one IPv4 CIDR naming the network the platform's
 servers sit on (`/32` and bare addresses accepted; a comma-separated list
-is still parsed for servers that straddle two ranges, and the pre-rollout
-name `ID_TRUSTED_APP_CIDRS` (pre-rollout) is still honoured). It describes a *network*,
+is still parsed for servers that straddle two ranges). It describes a *network*,
 not an application. Browser authorization stays public.
 
 Resolution rules, applied deterministically:
@@ -322,33 +321,18 @@ without guessing. Seeded rows stay empty on purpose: a table being created
 for the first time is not where a public URL or a domain gets invented. **A
 login method is only offered when all of its required keys are set.**
 
-### Environment overrides
-
-Any key above may also be set in the environment, where it wins over the
-stored row. That is the escape hatch for deployments that manage
-configuration as environment — an override, not a default, and the
-zero-config path leaves all of it unset. An overridden key is read-only in
-`/admin` (tagged `env`, `409` on any attempt to write it) and is never copied
-into the store. Blank counts as unset.
-
-Two keys read oddly as variables and have environment-shaped aliases:
-`IDENTITY_TRUSTED_NETWORK` pins `trustedCIDR`, and the pre-rollout names
-`ID_TRUSTED_NETWORK`, `ID_TRUSTED_APP_CIDRS` and `ID_CLIENT_SECRET` are still
-honoured for one release.
-
 ### Where this service thinks it lives
 
 `APP_BASE_URL` is what the OAuth callback URIs are built from, resolved per
 request in this order:
 
-1. the environment override, if there is one;
-2. the `APP_BASE_URL` row — what the setup wizard wrote;
-3. the URL the browser actually reached this service on (honouring
+1. the `APP_BASE_URL` row — what the setup wizard wrote;
+2. the URL the browser actually reached this service on (honouring
    `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy);
-4. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
+3. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
    call with no request to observe.
 
-Leave 1 and 2 unset and the service is simply correct about itself.
+Leave 1 unset and the service is simply correct about itself.
 `PARENT_DOMAIN` follows the same convention in the wizard — this host minus
 its own label, so `identity.wisp.net` proposes `wisp.net`.
 
@@ -603,7 +587,7 @@ applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 
 **Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
 `DB_PASSWORD` / `DB_NAME` are settings like any other — rows in
-`auth_tbl_Settings`, or environment overrides — so a deployment is described in
+`cfg_tbl_Setting` — so a deployment is described in
 one place. The pool connects lazily on first use, which makes "not filled
 in yet" an ordinary first-run state rather than a crash: the app still
 listens, `/setup` says which of the two stores is missing, and the schema is

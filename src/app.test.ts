@@ -26,8 +26,6 @@ interface FakeSession {
 
 const fake = {
   settings: {} as Record<string, string>,
-  /** Keys the environment pins — they win over `settings` and cannot be written. */
-  overrides: {} as Record<string, string>,
   /** State of the identity database as the wizard's probe would find it. */
   db: 'ok' as 'ok' | 'unconfigured' | 'unreachable',
   /** When set, the settings store fails with this reason. */
@@ -44,7 +42,6 @@ const fake = {
 
 function resetFakes() {
   fake.settings = { PARENT_DOMAIN: 'wisp.net' };
-  fake.overrides = {};
   fake.db = 'ok';
   fake.settingsError = null;
   fake.sessions.clear();
@@ -102,22 +99,13 @@ vi.mock('./settings', async (importOriginal) => {
   class SettingsStore {
     async getAll() {
       failIfAsked();
-      return { ...fake.settings, ...fake.overrides };
+      return { ...fake.settings };
     }
     async ping() {
       failIfAsked();
     }
-    fromEnvOnly() {
-      return { ...fake.overrides };
-    }
     async get(key: string) {
-      return { ...fake.settings, ...fake.overrides }[key];
-    }
-    isOverridden(key: string) {
-      return key in fake.overrides;
-    }
-    overriddenKeys() {
-      return Object.keys(fake.overrides);
+      return fake.settings[key];
     }
     invalidate() {}
     isConfigured() {
@@ -127,7 +115,7 @@ vi.mock('./settings', async (importOriginal) => {
       failIfAsked();
     }
     async listForAdmin() {
-      return Object.entries({ ...fake.settings, ...fake.overrides })
+      return Object.entries(fake.settings)
         .filter(([key]) => actual.isConsoleManaged(key))
         .map(([key, value]) => ({
         key,
@@ -136,7 +124,6 @@ vi.mock('./settings', async (importOriginal) => {
         hasValue: String(value ?? '').trim() !== '',
         secret: actual.isSecretKey(key),
         description: '',
-        source: key in fake.overrides ? 'environment' : 'store',
         }));
     }
     // Mirrors the real store's refusals by calling into it rather than
@@ -145,8 +132,6 @@ vi.mock('./settings', async (importOriginal) => {
       if (!actual.isManagedScope(app)) throw new actual.SettingScopeError(app);
       if (!actual.isConsoleManaged(key)) throw new actual.SettingUnmanagedError(key);
       if (app === '*' && actual.isSecretKey(key)) throw new actual.SettingScopeError('*', key);
-      if (app === actual.SETTINGS_SCOPE && key in fake.overrides)
-        throw new actual.SettingOverriddenError(key);
       fake.settings[key] = value;
     }
   }
@@ -573,16 +558,7 @@ describe('APP_BASE_URL resolution', () => {
     const res = await request(app).get('/api/setup/status').set('Host', 'identity.wisp.net');
     expect(res.status).toBe(200);
     expect(res.body.pinned).toEqual({ appBaseUrl: '', parentDomain: 'wisp.net', trustedCIDR:LOOPBACK });
-    expect(res.body.locked).toEqual({ appBaseUrl: false, parentDomain: false, trustedCIDR:false });
     expect(res.body.identityHostLabel).toBe('identity');
-  });
-
-  it('reports a pinned value as locked so the wizard cannot contradict it', async () => {
-    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ trustedCIDR: LOOPBACK });
-    const res = await request(app).get('/api/setup/status');
-    expect(res.body.pinned.appBaseUrl).toBe('https://identity.wisp.net');
-    expect(res.body.locked.appBaseUrl).toBe(true);
   });
 
   it('builds the OAuth callback from the URL the browser reported', async () => {
@@ -627,29 +603,19 @@ describe('APP_BASE_URL resolution', () => {
       .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://identity.wisp.net', ...CREDENTIALS });
     expect(on.status).toBe(200);
   });
-
-  it('lets the environment override win over the browser', async () => {
-    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ trustedCIDR: LOOPBACK });
-    const res = await request(app)
-      .post('/api/setup/start')
-      .send({ parentDomain: 'wisp.net', appBaseUrl: 'https://somewhere.else.example', ...CREDENTIALS });
-    expect(res.status).toBe(200);
-    expect(redirectUriOf(res.body.authUrl)).toBe('https://identity.wisp.net/auth/google/callback');
-  });
 });
 
-describe('/admin config and the environment', () => {
-  it('reports each setting with the source that is actually in force', async () => {
-    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
+describe('/admin config', () => {
+  it('reports the APP_BASE_URL row as what decides the callback URLs', async () => {
     const app = makeApp({ trustedCIDR: LOOPBACK });
+    fake.settings.APP_BASE_URL = 'https://identity.wisp.net';
     const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
     const res = await request(app).get('/api/admin/config').set('Cookie', `identity_sso=${session}`);
     expect(res.status).toBe(200);
     expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
-    expect(res.body.appBaseUrlSource).toBe('environment');
+    expect(res.body.appBaseUrlSource).toBe('store');
     expect(res.body.items).toContainEqual(
-      expect.objectContaining({ key: 'APP_BASE_URL', source: 'environment' })
+      expect.objectContaining({ key: 'APP_BASE_URL', value: 'https://identity.wisp.net' })
     );
     expect(res.body.providers[0].callbackUrl).toBe('https://identity.wisp.net/auth/google/callback');
   });
@@ -664,19 +630,6 @@ describe('/admin config and the environment', () => {
       .set('X-Forwarded-Host', 'identity.wisp.net');
     expect(res.body.appBaseUrl).toBe('https://identity.wisp.net');
     expect(res.body.appBaseUrlSource).toBe('request');
-  });
-
-  it('refuses a write to a key the environment pins, and says why', async () => {
-    fake.overrides.APP_BASE_URL = 'https://identity.wisp.net';
-    const app = makeApp({ trustedCIDR: LOOPBACK });
-    const session = seedSession({ iUserId: 1, bSuperAdmin: true, email: 'admin@wisp.net' });
-    const res = await request(app)
-      .put('/api/admin/config/APP_BASE_URL')
-      .set('Cookie', `identity_sso=${session}`)
-      .send({ value: 'https://elsewhere.wisp.net' });
-    expect(res.status).toBe(409);
-    expect(res.body.error).toContain('environment');
-    expect(fake.settings.APP_BASE_URL).toBeUndefined();
   });
 
   it('refuses an unmanaged scope rather than writing a row nothing reads', async () => {
