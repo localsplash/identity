@@ -2,6 +2,13 @@
 
 Identity owns `platform_db`: users, provider identities, tenants (businesses), memberships, SSO sessions and application browser sessions. Echo and Aida retain domain records and canonical ID mappings. Applications must not create an independent user, membership, or browser-session authority.
 
+PBX configuration is owned by the OfficePulse/Asterisk installation. Extensions,
+queues, queue membership, trunks and applied DID routes are read through the
+OfficePulse integration API. Identity's shared phone-number registry grants
+business access; it does not provision or mirror PBX configuration. See
+[PBX ownership and issue reconciliation](PBX_OWNERSHIP.md) for the POC boundary
+and the remaining requirements from issue #16.
+
 ## Session protocol
 
 `POST /api/token {code,redirect_uri}` preserves all existing fields and adds `appSession: {token}`. The new opaque 64-hex token belongs in an HttpOnly, Secure, host-only application cookie, with SameSite=Lax. Consumers validate browser CSRF/origin on mutations and never forward browser-controlled server credentials. Application tokens are SHA-256 hashed inside the same `identity_tbl_Session` table as SSO sessions, with `sAppOrigin` distinguishing token types. SSO cookies cannot be redeemed as application tokens and application credentials cannot sign into Identity's account/admin UI.
@@ -52,6 +59,12 @@ Tenant Admins may assign `TENANT_ADMIN` or `USER`, and cannot modify Super Admin
 IDs are positive safe JSON integers (maximum 9007199254740991). Unknown/unsafe identifiers and invalid payloads are rejected. Mutations record their actor and target in `identity_tbl_Audit` in the same transaction. Directory-user idempotency keys preserve existing global key semantics; reuse for a different email returns conflict. Tenant creation is create-by-unique-slug, not an ensure operation: repeat submissions return 409 so clients must use the listed tenant explicitly.
 
 ## Settings and cutover
+
+For the explicitly disposable `dockerappvm01-dev` environment, the owner has
+authorized deleting obsolete stores and compatibility data. The preservation and
+legacy-import guidance below describes migration into environments that need it;
+it is not a gate on this Dev cleanup. Deploy canonical consumers, delete their
+retired objects, and verify the remaining single authority.
 
 NocoDB base `PlatformConfig`, table `cfg_tbl_Setting`, fields `app`, `settingKey`, `settingValue`, `description`, `bSecret`, `dtCreated`, `dtUpdated` plus the NocoDB `Id`. Resolution is nonblank environment override, exact `identity` scope, then global `*`; Identity has no parent scope. Other apps' scope parents are fixed in the platform plan. Duplicate bases/tables/scoped keys are errors; blank seed rows are unset. Writes target the `identity` scope and do not overwrite global rows. Runtime reads do not bootstrap missing objects. Bootstrap explicitly creates the canonical table and seeds identity-scoped empty fields. Use `*` for intentionally shared `PARENT_DOMAIN`/`trustedCIDR`; provider/database secrets stay in `identity`.
 

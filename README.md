@@ -1,5 +1,8 @@
 # Consolidated platform foundation
 
+For settings writes, blank-row handling and the standalone duplicate audit, see
+[Settings integrity](docs/SETTINGS_INTEGRITY.md).
+
 This branch implements the v2 central tenant and application-session contract in [docs/PLATFORM_CONTRACT.md](docs/PLATFORM_CONTRACT.md). It requires `PlatformConfig/cfg_tbl_Setting`; copy legacy settings and preserve the existing Identity database before deployment. The older operational notes below describe the deployed baseline and are superseded where they mention independent app sessions, CIDR-only directory access, or legacy settings names.
 
 # identity — OAuth identity processor & redirector
@@ -66,8 +69,7 @@ The server-only endpoints — `POST /api/token`, `POST /api/apps/register`,
 request only when the caller's resolved IPv4 peer is inside
 `trustedCIDR` — one IPv4 CIDR naming the network the platform's
 servers sit on (`/32` and bare addresses accepted; a comma-separated list
-is still parsed for servers that straddle two ranges, and the pre-rollout
-name `ID_TRUSTED_APP_CIDRS` (pre-rollout) is still honoured). It describes a *network*,
+is still parsed for servers that straddle two ranges). It describes a *network*,
 not an application. Browser authorization stays public.
 
 Resolution rules, applied deterministically:
@@ -196,16 +198,45 @@ user entered straight from the portal.
 
 ## Installing
 
+**On a platform** (the shared MySQL and NocoDB from
+[AidaPlatformDB](https://github.com/localsplash/AidaPlatformDB)):
+`AidaPlatformDB/install.sh apps` clones this repo, writes `.env`
+(`NOCODB_BASE_URL`, `NOCODB_API_TOKEN`), creates the `identity` MySQL account,
+seeds the rows and starts `compose.yaml`. By hand it is the same three things:
+`.env` from `.env.example`, `scripts/db-users.sh` against the shared MySQL, and
+`docker compose up -d --build` with the `BUILD_*` stamps exported. Then open
+`/setup` in a browser to claim the instance.
+
+**Self-contained** (development, or a throwaway instance with a MySQL of its
+own):
+
 ```bash
-scripts/install.sh      # generates the DB passwords, brings everything up
+scripts/install.sh      # generates the DB passwords, brings compose.dev.yaml up
 ```
 
-Then open the service in a browser and follow `/setup`. That is the whole
-installation: nothing else is edited by hand.
+Then open the service in a browser and follow `/setup`, which also asks for
+the bundled database's coordinates (host `db`). Identity applies its own
+schema either way; the only thing it expects to already exist is a NocoDB.
 
-Identity owns its data. `docker-compose.yml` brings up its own MySQL on a
-private network — not published, not shared — and this app applies its own
-schema to it. The only thing it expects to already exist is a NocoDB.
+### On a shared MySQL
+
+An environment that runs Identity against its own shared MySQL instead of the
+bundled one creates the database and account with `scripts/db-users.sh`. The
+script is idempotent: it converges the grants on every run, and a new password
+rotates it. Pass the same `DB_*` values Identity reads (its PlatformConfig rows
+or environment) plus the server's admin password:
+
+```bash
+docker run --rm --network <network> -v "$PWD/scripts:/scripts:ro" \
+  -e DB_HOST=<mysql host> -e DB_PASSWORD=… -e MYSQL_ADMIN_PASSWORD=… \
+  mysql:8.4 bash /scripts/db-users.sh
+```
+
+It creates `platform_db` if missing, and the `identity` account (`'%'`) with
+`ALL PRIVILEGES` on it and nothing else, since Identity applies its own schema.
+`DB_NAME`, `DB_USER`, `DB_PORT` and `MYSQL_ADMIN_USER` override the defaults.
+The bundled MySQL doesn't need the script: it creates the same account from
+`MYSQL_USER` when its volume is first initialised.
 
 ## Configuration
 
@@ -220,24 +251,27 @@ first-run wizard collects them:
 | --- | --- | --- |
 | NocoDB URL | `/data/config.json` | It is where the settings are |
 | NocoDB API token | `/data/config.json` | It is how they are read |
-| `trustedCIDR` | `auth_tbl_Settings` | Required before anything is admitted; the row itself is platform-wide, so it goes to the store like every other setting |
+| `trustedCIDR` | `cfg_tbl_Setting` | Required before anything is admitted; the row itself is platform-wide, so it goes to the store like every other setting |
 
 `/data` is the `identity-config` volume, so an instance is set up once and
 survives rebuilds. Both NocoDB values may instead be stated in `.env`, where
 they win and the wizard skips step 1.
 
 Everything else — the trusted network, the public URL, the OAuth
-credentials — is a row in the **`auth_tbl_Settings`** table of the
-**`IdentityBase`** base in NocoDB at `nocodb.X.TLD`. The MySQL coordinates
-come from `docker-compose.yml` and are not asked about at all.
+credentials — is a row in the **`cfg_tbl_Setting`** table of the
+**`PlatformConfig`** base in NocoDB at `nocodb.X.TLD`, in the `identity`
+scope (or `*` for platform-wide keys such as `PARENT_DOMAIN` and
+`trustedCIDR`). The MySQL coordinates are rows too: `DB_HOST` derives
+`lsdb.<PARENT_DOMAIN>` when unset, and the wizard's database step asks for
+whatever is still missing.
 
 ### Naming
 
 | Thing | Rule | Here |
 | --- | --- | --- |
 | Public URL | `{repo}.X.TLD`, lowercase | `identity.X.TLD` |
-| NocoDB base | `{Repo}Base` | `IdentityBase` |
-| Settings table | `auth_tbl_Settings` | `auth_tbl_Settings` |
+| NocoDB base | `PlatformConfig`, shared by every application | `PlatformConfig` |
+| Settings table | `cfg_tbl_Setting`, one `app` scope per application | `cfg_tbl_Setting` |
 
 The short form `id` is retired: it reads as "identifier" everywhere it
 appears, which is genuinely ambiguous in an application whose primary key is
@@ -268,7 +302,7 @@ A change made in NocoDB reaches a running instance **without a restart**:
 ### Failure is loud
 
 There is no fallback. If NocoDB is unreachable, the token is rejected, or no
-base named `IdentityBase` exists:
+base named `PlatformConfig` exists:
 
 - **at startup** the app retries once after 5 seconds, then exits non-zero
   naming the URL, the base and which of the three it was;
@@ -299,33 +333,18 @@ without guessing. Seeded rows stay empty on purpose: a table being created
 for the first time is not where a public URL or a domain gets invented. **A
 login method is only offered when all of its required keys are set.**
 
-### Environment overrides
-
-Any key above may also be set in the environment, where it wins over the
-stored row. That is the escape hatch for deployments that manage
-configuration as environment — an override, not a default, and the
-zero-config path leaves all of it unset. An overridden key is read-only in
-`/admin` (tagged `env`, `409` on any attempt to write it) and is never copied
-into the store. Blank counts as unset.
-
-Two keys read oddly as variables and have environment-shaped aliases:
-`IDENTITY_TRUSTED_NETWORK` pins `trustedCIDR`, and the pre-rollout names
-`ID_TRUSTED_NETWORK`, `ID_TRUSTED_APP_CIDRS` and `ID_CLIENT_SECRET` are still
-honoured for one release.
-
 ### Where this service thinks it lives
 
 `APP_BASE_URL` is what the OAuth callback URIs are built from, resolved per
 request in this order:
 
-1. the environment override, if there is one;
-2. the `APP_BASE_URL` row — what the setup wizard wrote;
-3. the URL the browser actually reached this service on (honouring
+1. the `APP_BASE_URL` row — what the setup wizard wrote;
+2. the URL the browser actually reached this service on (honouring
    `X-Forwarded-Proto` / `X-Forwarded-Host` from a reverse proxy);
-4. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
+3. `https://identity.<PARENT_DOMAIN>` — the naming convention, for the rare
    call with no request to observe.
 
-Leave 1 and 2 unset and the service is simply correct about itself.
+Leave 1 unset and the service is simply correct about itself.
 `PARENT_DOMAIN` follows the same convention in the wizard — this host minus
 its own label, so `identity.wisp.net` proposes `wisp.net`.
 
@@ -353,13 +372,13 @@ claiming it.
    where every application reads it, and the service restarts into them.
    Skipped entirely when `.env` already states the NocoDB values.
 
-   There is no step for the identity database. It is the MySQL in
-   `docker-compose.yml`, and the app migrates it itself.
+   The database step asks for `platform_db`'s coordinates only when no row
+   answers (`DB_HOST` derives `lsdb.<PARENT_DOMAIN>`); the app migrates it
+   itself.
 2. The wizard fills in this service's public URL from the browser's own
    address bar and the application domain from that host minus its label
    (`identity.wisp.net` → `wisp.net`) — both editable, neither guessed
-   server-side, and both fixed and read-only when the environment pins
-   them. The admin confirms the application domain (`X.TLD`) and enters
+   server-side. The admin confirms the application domain (`X.TLD`) and enters
    credentials for **Google or Microsoft** (the wizard is limited to
    providers that can prove a domain; Microsoft additionally requires a
    tenant ID — `common` cannot prove anything). In production the service
@@ -368,7 +387,7 @@ claiming it.
 3. The credentials are held in a short-lived cookie — *not* saved — while a
    real OAuth round trip runs against them.
 4. Only if the sign-in works **and** the verified account is on the Super
-   Admin domain does the wizard persist everything to `auth_tbl_Settings` (also
+   Admin domain does the wizard persist everything to `cfg_tbl_Setting` (also
    minting `IDENTITY_CLIENT_SECRET`), make the claimer Super System Admin, and
    land them on `/admin`. A failed or off-domain attempt saves nothing.
 5. If the sign-in works but the account is on a *different* domain, the
@@ -382,7 +401,7 @@ changes happen in `/admin` or directly in NocoDB at `nocodb.X.TLD`.
 
 To start over, remove the `identity-config` volume (the app forgets where
 its settings are and step 1 returns) and clear the provider rows in
-`auth_tbl_Settings` (the instance becomes unclaimed again).
+`cfg_tbl_Setting` (the instance becomes unclaimed again).
 
 ## Super System Admin
 
@@ -391,7 +410,7 @@ domain is one of `SUPERADMIN_DOMAIN` (default: `PARENT_DOMAIN`). Only
 providers that cryptographically vouch for the domain qualify — Google
 (Workspace `hd` / verified address) does; Microsoft only when the app is
 locked to a single tenant, since with a `common` authority any directory
-could assert any address. Admins can edit `auth_tbl_Settings`, inspect users and
+could assert any address. Admins can edit `cfg_tbl_Setting`, inspect users and
 identities, unlink identities (never a user's last one), and revoke
 sessions.
 
@@ -564,7 +583,7 @@ so no schema change is needed.
 
 Identity data lives in MySQL (the identity database) — the shared platform identity
 database on **LSAidaOffice01** — and **this repository is its sole schema
-owner**. There is no external schema source: `EchoDatabase/init` is not
+owner**. There is no external schema source: `AidaPlatformDB/echo/init` is not
 used and must not be. `identity_db.identity_tbl_User.iUserId` is the platform-wide
 person id; tenant, role, extension, and prompt data belong to the
 applications (e.g. Aida UID mappings in NocoDB), never as columns here.
@@ -580,12 +599,13 @@ applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 
 **Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
 `DB_PASSWORD` / `DB_NAME` are settings like any other — rows in
-`auth_tbl_Settings`, or environment overrides — so a deployment is described in
+`cfg_tbl_Setting` — so a deployment is described in
 one place. The pool connects lazily on first use, which makes "not filled
 in yet" an ordinary first-run state rather than a crash: the app still
 listens, `/setup` says which of the two stores is missing, and the schema is
 applied as soon as the coordinates work. A change of coordinates takes a
-restart.
+restart. On a shared MySQL the account behind them comes from
+`scripts/db-users.sh` ([On a shared MySQL](#on-a-shared-mysql)).
 
 ### Migrations
 
@@ -601,11 +621,10 @@ users keep their `iUserId` and keep authenticating.
 To change the schema, append a new named migration; never edit, rename, or
 reorder a released one.
 
-**Local vs production.** `docker-compose.yml` / `.env.example` show how to
-point a dev instance at a disposable local MySQL (export `DB_HOST` and
-friends, or fill the rows in NocoDB once). Production is the shared
-the identity database on LSAidaOffice01 (`DB_HOST` pointing at that MySQL) — treat it as
-live data at all times.
+**Local vs production.** `compose.dev.yaml` brings up a disposable MySQL
+beside the app and the wizard's database step points the instance at it.
+Production is the platform's shared MySQL (AidaPlatformDB), `DB_HOST` derived
+or set by a row — treat it as live data at all times.
 
 **Backup / restore / rollback (production).** Take a consistent dump
 before every deploy that includes a new migration:
@@ -630,5 +649,41 @@ npm test        # vitest
 npm run build   # tsc → dist/
 ```
 
-`docker-compose.yml` brings up this app and everything it owns. The only
-thing it expects to already exist is NocoDB.
+`compose.dev.yaml` brings up this app with a MySQL of its own; `compose.yaml`
+is the platform deployment. Both expect a NocoDB to already exist.
+
+## Health version and Pacific timezone
+
+The liveness response includes `version` (`YYYY.M.D.H.M`), full Git `revision`,
+`sourceUpdatedAt` (ISO 8601 with Pacific offset), `timeZone` (`America/Los_Angeles`),
+and `dirty`. Existing status fields and readiness behavior are preserved.
+`GET /healthz` stays independent of authentication and external dependencies.
+
+Versions use HEAD's committer timestamp in Pacific time (PST/PDT), never build time.
+For example, `2026-09-14T21:30:42Z` becomes `2026.9.14.14.30` and
+`sourceUpdatedAt: "2026-09-14T14:30:42-07:00"`. The clock belongs to the machine
+creating the commit, including GitHub for web-created commits. Rebuilding a commit
+preserves its version. Same-minute commits and the repeated autumn DST hour are
+distinguished by `revision`; dates alone are not a monotonic sequence.
+
+`npm run build` embeds identity in the artifact. Uncommitted/staged/untracked changes
+append `-dirty`; commit before building releases. Unbuilt source development reports
+`unbuilt` with null revision fields. Package and API contract versions stay separate.
+Runtime `TZ` defaults to `America/Los_Angeles` and may be overridden explicitly;
+version formatting always stays Pacific. Docker includes timezone data. Explicit UTC
+storage/protocol timestamp contracts remain UTC to preserve existing data semantics.
+
+Docker/source archive builds require all three values: `BUILD_REVISION` (full SHA),
+`SOURCE_DATE_EPOCH` (Git committer epoch), and `BUILD_DIRTY` (`true` or `false`).
+Missing or malformed identity fails the build. The wrapper derives them from Git:
+
+```sh
+scripts/with-build-info.sh sh -c 'docker build \
+  --build-arg BUILD_REVISION --build-arg SOURCE_DATE_EPOCH --build-arg BUILD_DIRTY \
+  -t identity:local .'
+scripts/with-build-info.sh docker compose up -d --build
+
+```
+
+External orchestrators building this Dockerfile must forward these same build args.
+No runtime Git checkout or version environment override is needed.

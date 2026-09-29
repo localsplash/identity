@@ -1,0 +1,40 @@
+{
+  "version": "1",
+  "information": {
+    "name": "identity-sso",
+    "displayName": "Identity SSO Bridge",
+    "description": "Single sign-on bridge from the UISP client zone to the platform Identity service.",
+    "url": "https://github.com/localsplash/identity",
+    "version": "2026.9.23",
+    "unmsVersionCompliancy": {
+      "min": "2.1.0",
+      "max": null
+    },
+    "ucrmVersionCompliancy": {
+      "min": "2.14.0",
+      "max": null
+    },
+    "author": "LocalSplash"
+  },
+  "configuration": [
+    {
+      "key": "identityBaseUrl",
+      "label": "Identity Base URL",
+      "description": "Public Identity base URL, e.g. https://identity.X.TLD (no trailing slash).",
+      "required": 1
+    },
+    {
+      "key": "ssoSecret",
+      "label": "SSO Shared Secret",
+      "description": "Shared secret matching the identity/UISP_SSO_SECRET row in PlatformConfig. Keep this private.",
+      "required": 1
+    }
+  ],
+  "menu": [
+    {
+      "label": "Platform sign-in",
+      "type": "client",
+      "target": "blank"
+    }
+  ]
+}

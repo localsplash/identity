@@ -1,12 +1,14 @@
 #!/usr/bin/env bash
 #
-# Bring up identity for the first time.
+# Bring up a self-contained identity (compose.dev.yaml) for the first time:
+# local development or a throwaway install. A platform deployment uses
+# compose.yaml and AidaPlatformDB/install.sh instead.
 #
 # The only thing this generates is the pair of MySQL passwords, because a
 # database container cannot ask a browser for them the way the rest of the
 # configuration is collected. Everything else — the NocoDB address, the API
-# token, the trusted network, the OAuth credentials — is typed into /setup
-# once this is running.
+# token, the trusted network, the database coordinates, the OAuth credentials
+# — is typed into /setup once this is running.
 #
 # Safe to re-run: existing values in .env are never overwritten.
 set -euo pipefail
@@ -44,14 +46,15 @@ if ! docker network inspect npm_network >/dev/null 2>&1; then
 fi
 
 echo "Starting identity and its database…"
-docker compose up -d --build
+docker compose -f compose.dev.yaml up -d --build
 
 cat <<'DONE'
 
 Up. Open this service in a browser to finish setting it up:
 
   /setup  asks for the NocoDB URL, an API token, and the trusted network,
-          then restarts itself and asks for your Google or Microsoft OAuth
+          then the database (host db, user identity, database platform_db,
+          the DB_PASSWORD in .env), then your Google or Microsoft OAuth
           client credentials.
 
 The first person to complete that wizard becomes Super System Admin, so do

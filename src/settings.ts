@@ -1,12 +1,67 @@
 import { AppConfig } from './config';
 
 /** PlatformConfig is discovered by unique name; runtime reads never bootstrap.
- * Resolution: nonblank environment override > identity > global '*'. Identity
- * has no shared parent scope. Blank seed rows are unset, duplicate scoped keys
- * are configuration errors, and secrets are never promoted to global scope. */
+ * Resolution: identity > global '*'. The environment cannot pin a row: two
+ * homes for one value meant a row could be edited with no effect and nothing
+ * on the host to say why. Identity has no shared parent scope. Blank seed rows
+ * are unset, duplicate scoped keys are configuration errors, and secrets are
+ * never promoted to global scope. */
 export const SETTINGS_BASE_NAME = 'PlatformConfig';
 export const SETTINGS_TABLE_NAME = 'cfg_tbl_Setting';
 export const SETTINGS_SCOPE = 'identity';
+
+/**
+ * Scopes this console may list and write.
+ *
+ * PlatformConfig is shared: EchoService reads `echo-service`, EchoWeb reads
+ * `echo-web` under `echo`, and `*` is read by everything. Managing only
+ * `identity` meant a write for another app's key silently created an
+ * identity-scoped row nobody reads, while the console displayed it as set.
+ */
+export const MANAGED_SCOPES = ['*', 'identity', 'echo', 'echo-web', 'echo-service'] as const;
+export type ManagedScope = (typeof MANAGED_SCOPES)[number];
+
+export function isManagedScope(app: string): app is ManagedScope {
+  return (MANAGED_SCOPES as readonly string[]).includes(app);
+}
+
+/**
+ * Keys this console deliberately does not manage.
+ *
+ * Bandwidth credentials belong to a carrier application, which binds per-DID
+ * through `sms_tbl_BusinessPhone.iCarrierApplicationId`. The PlatformConfig
+ * `BANDWIDTH_*` rows are only the fallback for a phone that has no such row,
+ * and the per-carrier credentials win whenever one exists. Offering them here
+ * would steer an operator into the deprecated path instead of the carrier
+ * application that actually routes their number.
+ *
+ * `BANDWIDTH_MESSAGING_API_BASE_URL` is NOT in this list: `bandwidthBase()`
+ * reads it from PlatformConfig alone and never consults carrier settings, so
+ * it is a genuine deployment-wide endpoint, not a per-carrier credential.
+ */
+export const UNMANAGED_KEYS = [
+  'BANDWIDTH_ACCOUNT_ID',
+  'BANDWIDTH_API_TOKEN',
+  'BANDWIDTH_API_SECRET',
+  'BANDWIDTH_APPLICATION_ID',
+] as const;
+
+export function isConsoleManaged(key: string): boolean {
+  return !(UNMANAGED_KEYS as readonly string[]).includes(key);
+}
+
+/**
+ * Keys whose value must never be returned to a browser, and which may not be
+ * written to the global `*` scope.
+ *
+ * TYCHRON_WEBHOOK_BASIC_PASS is why this is not the narrower word list it looks like
+ * it should be: it carries PASS, not PASSWORD, so the earlier pattern did not
+ * match and the credential gating EchoService's webhooks would have been
+ * stored unflagged.
+ */
+export function isSecretKey(key: string): boolean {
+  return /SECRET|PASSWORD|PASS|TOKEN|APP_KEY|CREDENTIAL/i.test(key);
+}
 
 export interface SettingDef {
   key: string;
@@ -17,7 +72,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'PARENT_DOMAIN',
     description:
-      'Apex domain (X.TLD) that all participating apps live under, e.g. wisp.net. ' +
+      'Apex domain (X.TLD) that all participating apps live under, e.g. X.TLD. ' +
       'Drives the SSO cookie scope and the redirect_uri allowlist (any https host ' +
       'under this domain). This is where the applications live; where the ' +
       'identities come from is SUPERADMIN_DOMAIN, which defaults to this but is ' +
@@ -26,7 +81,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
   {
     key: 'APP_BASE_URL',
     description:
-      'Public base URL of this identity app, e.g. https://identity.wisp.net. Used to ' +
+      'Public base URL of this identity app, e.g. https://identity.X.TLD. Used to ' +
       'build the OAuth callback URIs registered with each provider. Leave it empty ' +
       'and the URL the browser reached this service on is used instead — the setup ' +
       'wizard writes exactly that, so it normally never has to be typed.',
@@ -35,8 +90,9 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     key: 'DB_HOST',
     description:
       'Hostname of the MySQL server holding platform_db, the shared platform identity ' +
-      'database this app owns and migrates itself. Required — the app has no ' +
-      'sessions, users or identities until it is set. A change takes a restart.',
+      'database this app owns and migrates itself. Empty derives lsdb.<PARENT_DOMAIN>, ' +
+      'the platform convention; set it only where the server is named otherwise. ' +
+      'A change takes a restart.',
   },
   {
     key: 'DB_PORT',
@@ -82,7 +138,7 @@ export const KNOWN_SETTINGS: SettingDef[] = [
     description:
       'Where to send a user who signs in without a pending application request ' +
       '(e.g. entering straight from the UISP portal), such as ' +
-      'https://echo.wisp.net/auth/callback. Empty = show the account page.',
+      'https://echo.X.TLD/auth/callback. Empty = show the account page.',
   },
   { key: 'GOOGLE_CLIENT_ID', description: 'Google OAuth 2.0 client ID.' },
   { key: 'GOOGLE_CLIENT_SECRET', description: 'Google OAuth 2.0 client secret.' },
@@ -106,62 +162,81 @@ export const KNOWN_SETTINGS: SettingDef[] = [
       "The UISP bridge plugin's public URL (UCRM generates it at install time). The " +
       'ISP login button is hidden until this is set.',
   },
-  { key: 'UISP_BASE_URL', description: 'UISP instance base URL, e.g. https://my.wisp.net.' },
+  { key: 'UISP_BASE_URL', description: 'UISP instance base URL, e.g. https://my.X.TLD.' },
   {
     key: 'UISP_CRM_APP_KEY_READ',
     description:
       'Read-only UISP CRM App Key. Used by applications to look up ' +
       'subscriber records when provisioning accounts.',
   },
+  // ── Read by EchoService, in the 'echo-service' scope ────────────────────────────
+  ...['BANDWIDTH', 'TYCHRON'].flatMap((carrier) => [
+    {
+      key: `${carrier}_WEBHOOK_BASIC_USER`,
+      description: `${carrier} webhook Basic Auth username for /v1/${carrier.toLowerCase()}/*. ` +
+        `Callers inside trustedCIDR are admitted without it. Leaving both this and ` +
+        `${carrier}_WEBHOOK_BASIC_PASS blank disables authentication for this carrier.`,
+    },
+    {
+      key: `${carrier}_WEBHOOK_BASIC_PASS`,
+      description: `${carrier} webhook Basic Auth password. Changes take effect within 30 seconds ` +
+        `without a restart. Independent of other carriers and outbound API credentials.`,
+    },
+  ]),
+  {
+    key: 'CORS_ORIGINS',
+    description: 'Comma-separated browser origins EchoService accepts. Deployment configuration.',
+  },
+  {
+    key: 'BANDWIDTH_MESSAGING_API_BASE_URL',
+    description:
+      "Bandwidth's own API base, deployment-wide. Defaults to " +
+      'https://messaging.bandwidth.com/api/v2 when blank. Not a credential and not ' +
+      'per-carrier: account credentials belong to the carrier application.',
+  },
+  { key: 'TYCHRON_SMS_URL', description: 'Platform SMS send endpoint; defaults to https://sms.tychron.online/sms.' },
+  { key: 'TYCHRON_MMS_URL', description: 'Platform MMS send endpoint; defaults to https://mms.tychron.online/api/v1/mms.' },
 ];
+
+/** The console offers empty fields without persisting empty rows. */
+function defaultScope(key: string): ManagedScope {
+  if (key === 'trustedCIDR' || key === 'PARENT_DOMAIN') return '*';
+  if (['BANDWIDTH_WEBHOOK_BASIC_USER', 'BANDWIDTH_WEBHOOK_BASIC_PASS',
+    'TYCHRON_WEBHOOK_BASIC_USER', 'TYCHRON_WEBHOOK_BASIC_PASS', 'CORS_ORIGINS',
+    'BANDWIDTH_MESSAGING_API_BASE_URL', 'TYCHRON_SMS_URL', 'TYCHRON_MMS_URL'].includes(key)) return 'echo-service';
+  return 'identity';
+}
 
 export type Settings = Record<string, string>;
 
-// ─── Environment overrides ────────────────────────────────────────────────────
-
-/**
- * Any known setting may be pinned in the environment, where it wins over the
- * store. This is the escape hatch for deployments that manage configuration
- * as environment (a Helm chart, a CI secret) and for bringing an instance up
- * before NocoDB exists at all; the zero-config path leaves all of it unset.
- *
- * Blank and whitespace-only values are ignored rather than treated as an
- * override of "" — an empty variable in a compose file means "not set here".
- */
-export function settingOverridesFromEnv(env: NodeJS.ProcessEnv = process.env): Settings {
-  const overrides: Settings = {};
-  const take = (key: string, from: string): void => {
-    if (key in overrides) return;
-    const raw = env[from];
-    if (typeof raw === 'string' && raw.trim() !== '') overrides[key] = raw.trim();
-  };
-  for (const { key } of KNOWN_SETTINGS) take(key, key);
-  // Environment-shaped spellings for keys whose canonical name is not, and
-  // the pre-rollout names kept working for one release.
-  for (const [key, names] of Object.entries(ENV_ALIASES)) {
-    for (const name of names) take(key, name);
-  }
-  return overrides;
-}
-
-/**
- * Environment names that pin a setting whose canonical key reads oddly as a
- * variable (`trustedCIDR`), plus the names this app used before `id` became
- * `identity`. First one set wins, canonical spelling first.
- */
-export const ENV_ALIASES: Record<string, string[]> = {
-  trustedCIDR: ['IDENTITY_TRUSTED_NETWORK', 'ID_TRUSTED_NETWORK', 'ID_TRUSTED_APP_CIDRS'],
-  IDENTITY_CLIENT_SECRET: ['ID_CLIENT_SECRET'],
-};
-
-/** Raised when a write targets a key the environment has pinned. */
-export class SettingOverriddenError extends Error {
+/** Raised when a write targets a key this console deliberately does not manage. */
+export class SettingUnmanagedError extends Error {
   constructor(public key: string) {
     super(
-      `${key} is set in this app's environment, which overrides the settings ` +
-        'store. Change it there (and restart) or unset it to manage it here.'
+      `${key} is a carrier-application credential and is not managed here. It binds to a ` +
+        'carrier application, which binds per-DID through sms_tbl_BusinessPhone. Set it on ' +
+        'the carrier application instead; the PlatformConfig row is only a fallback for a ' +
+        'business phone that has none.'
     );
-    this.name = 'SettingOverriddenError';
+    this.name = 'SettingUnmanagedError';
+  }
+}
+
+/** Raised when a write targets a scope this console may not manage. */
+export class SettingScopeError extends Error {
+  constructor(
+    public app: string,
+    public key?: string
+  ) {
+    super(
+      key
+        ? `${key} looks like a secret, so it cannot be written to the global '*' scope ` +
+          'where every application can read it. Write it to the scope of the app that ' +
+          'needs it.'
+        : `'${app}' is not a scope this console manages. Managed scopes are ` +
+          `${MANAGED_SCOPES.map((m) => `'${m}'`).join(', ')}.`
+    );
+    this.name = 'SettingScopeError';
   }
 }
 
@@ -182,13 +257,16 @@ export class SettingsUnavailableError extends Error {
 }
 
 /** Where an effective value came from — surfaced to /admin and the wizard. */
-export type SettingSource = 'environment' | 'store';
-
 export interface AdminSetting {
   key: string;
+  /** Which app reads this row. */
+  app: string;
+  /** Empty for secrets — see `hasValue`. */
   value: string;
+  /** Whether a secret is set, since its value is never sent to the browser. */
+  hasValue: boolean;
+  secret: boolean;
   description: string;
-  source: SettingSource;
 }
 
 // ─── NocoDB v2 API client ─────────────────────────────────────────────────────
@@ -217,23 +295,11 @@ interface ResolvedIds {
 }
 
 export class SettingsStore {
+  private static writes: Promise<void> = Promise.resolve();
   private ids: { at: number; ids: ResolvedIds } | null = null;
   private cache: { at: number; settings: Settings } | null = null;
 
-  constructor(
-    private config: AppConfig,
-    private overrides: Settings = settingOverridesFromEnv()
-  ) {}
-
-  /** True when the environment pins this key, so the store cannot decide it. */
-  isOverridden(key: string): boolean {
-    return key in this.overrides;
-  }
-
-  /** The keys the environment is pinning, for logging and the admin UI. */
-  overriddenKeys(): string[] {
-    return Object.keys(this.overrides);
-  }
+  constructor(private config: AppConfig) {}
 
   private headers(): Record<string, string> {
     return {
@@ -346,8 +412,8 @@ export class SettingsStore {
   }
 
   /**
-   * Create the base and table if they are missing, and seed every known key
-   * so the admin never has to guess what goes in the table.
+   * Create the base and table if missing. The admin catalog supplies empty fields
+   * without writing blank rows.
    *
    * This is the one path allowed to create the base — everywhere else a
    * missing base is an error, because a second base appearing by accident is
@@ -407,30 +473,14 @@ export class SettingsStore {
         ));
       this.ids = { at: Date.now(), ids: { baseId: base.id, tableId: table.id } };
 
-      // Seed missing keys so the full settings menu is visible. Values are
-      // left EMPTY — a table being created for the first time is not the
-      // place to invent a public URL or a domain, and an environment
-      // override is not copied in either: it would be a snapshot that goes
-      // stale the moment the environment changed. The setup wizard fills
-      // these in from the URL the first admin actually reached this app on.
-      const rows = await this.listRows();
-      const present = new Set(rows.filter(r => r.app === SETTINGS_SCOPE).map((r) => r.settingKey));
-      const missing = KNOWN_SETTINGS.filter((s) => !present.has(s.key));
-      if (missing.length) {
-        // v2 records POST accepts an array for bulk insert.
-        await this.api(
-          'POST',
-          `/api/v2/tables/${table.id}/records`,
-          missing.map((s) => ({ app: SETTINGS_SCOPE, settingKey: s.key, settingValue: '', description: s.description, bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(s.key) }))
-        );
-      }
+
     } catch (err) {
       this.ids = null;
       throw this.asUnavailable(err);
     }
   }
 
-  private async listRows(): Promise<NocoTableRow[]> {
+  private async listRows(validateDuplicates = true): Promise<NocoTableRow[]> {
     const { tableId } = await this.resolveIds();
     try {
       const out: NocoTableRow[] = [];
@@ -444,11 +494,16 @@ export class SettingsStore {
         if (page.list.length < 200 || page.pageInfo?.isLastPage === true) break;
         offset += 200;
       }
-      const seen = new Set<string>();
-      for (const row of out) {
-        const key = JSON.stringify([row.app, row.settingKey]);
-        if (seen.has(key)) throw new SettingsUnavailableError('duplicate', `Duplicate setting for scope ${row.app} and key ${row.settingKey}`);
-        seen.add(key);
+      if (validateDuplicates) {
+        const groups = new Map<string, NocoTableRow[]>();
+        for (const row of out) {
+          const key = JSON.stringify([row.app, row.settingKey]);
+          groups.set(key, [...(groups.get(key) || []), row]);
+        }
+        const duplicates = [...groups.values()].filter((group) => group.length > 1);
+        if (duplicates.length) throw new SettingsUnavailableError('duplicate',
+          'Duplicate settings: ' + duplicates.map((group) =>
+            `${group[0].app}/${group[0].settingKey} (rows ${group.map((row) => row.Id).join(', ')})`).join('; '));
       }
       return out;
     } catch (err) {
@@ -460,9 +515,8 @@ export class SettingsStore {
   }
 
   /**
-   * All settings as a map, with the environment overriding the store. Cached
-   * briefly; empty values are omitted, so a blank row reads as "not set"
-   * rather than as an empty string that would shadow the override.
+   * All settings as a map. Cached briefly; empty values are omitted, so a
+   * blank row reads as "not set" rather than as an empty string.
    */
   async getAll(): Promise<Settings> {
     if (this.cache && Date.now() - this.cache.at < CACHE_TTL_MS) return this.cache.settings;
@@ -473,72 +527,95 @@ export class SettingsStore {
         settings[r.settingKey] = String(r.settingValue).trim();
       }
     }
-    Object.assign(settings, this.overrides);
     this.cache = { at: Date.now(), settings };
     return settings;
+  }
+
+  /** Read-only integrity report: no secret values, including when runtime reads fail. */
+  async audit() {
+    const rows = await this.listRows(false);
+    const groups = new Map<string, NocoTableRow[]>();
+    for (const row of rows) {
+      const key = JSON.stringify([String(row.app).trim().toLowerCase(), String(row.settingKey).trim().toLowerCase()]);
+      groups.set(key, [...(groups.get(key) || []), row]);
+    }
+    return {
+      duplicates: [...groups.values()].filter((group) => group.length > 1).map((group) => ({
+        app: group[0].app, key: group[0].settingKey, rowIds: group.map((row) => row.Id),
+      })),
+      blankRows: rows.filter((row) => !String(row.settingValue ?? '').trim()).map((row) => ({
+        app: row.app, key: row.settingKey, rowId: row.Id,
+      })),
+    };
   }
 
   async get(key: string): Promise<string | undefined> {
     return (await this.getAll())[key];
   }
 
-  /**
-   * Rows including empty values and descriptions — for the admin UI. The
-   * effective value is reported, so a key the environment pins shows what is
-   * actually in force (tagged 'environment', and not editable) rather than
-   * the store row it is shadowing.
-   */
+  /** Rows including empty values and descriptions — for the admin UI. */
   async listForAdmin(): Promise<AdminSetting[]> {
     const rows = await this.listRows();
-    const described = new Map(KNOWN_SETTINGS.map((s) => [s.key, s.description]));
-    const effective = await this.getAll();
-    const scopedRows = new Map<string, NocoTableRow>();
-    for (const row of [...rows.filter(r=>r.app === '*'), ...rows.filter(r=>r.app === SETTINGS_SCOPE)]) scopedRows.set(row.settingKey,row);
-    const items: AdminSetting[] = [...scopedRows.values()]
-      .filter((r) => r.settingKey && (r.app === SETTINGS_SCOPE || r.app === '*'))
-      .map((r) => ({
-        key: r.settingKey,
-        value: this.isOverridden(r.settingKey)
-          ? this.overrides[r.settingKey]
-          : effective[r.settingKey] ?? '',
-        description: r.description == null ? '' : String(r.description),
-        source: this.isOverridden(r.settingKey) ? ('environment' as const) : ('store' as const),
-      }));
 
-    // An override for a key the store has no row for yet (NocoDB seeded
-    // before the key existed, or bootstrap has not run) is still in force —
-    // show it rather than letting it act invisibly.
-    const present = new Set(items.map((i) => i.key));
-    for (const [key, value] of Object.entries(this.overrides)) {
-      if (present.has(key)) continue;
-      items.push({
-        key,
-        value,
-        description: described.get(key) ?? '',
-        source: 'environment',
+    // One entry per (scope, key). Rows are NOT collapsed to an effective
+    // value any more: an `echo-service` row and an `identity` row of the same name
+    // are different settings read by different applications, and showing only
+    // the winner would hide the one the operator came to edit.
+    const items: AdminSetting[] = rows
+      .filter((r) => r.settingKey && isManagedScope(r.app) && isConsoleManaged(r.settingKey))
+      .map((r) => {
+        const secret = isSecretKey(r.settingKey);
+        const value = String(r.settingValue ?? '');
+        return {
+          key: r.settingKey,
+          app: r.app,
+          value: secret ? '' : value,
+          hasValue: value.trim() !== '',
+          secret,
+          description: r.description == null ? '' : String(r.description),
+        };
       });
+
+    for (const def of KNOWN_SETTINGS) {
+      const app = defaultScope(def.key);
+      if (items.some((item) => item.app === app && item.key === def.key)) continue;
+      items.push({ key: def.key, app, value: '', hasValue: false,
+        secret: isSecretKey(def.key), description: def.description });
     }
-    return items.sort((a, b) => a.key.localeCompare(b.key));
+    return items.sort((a, b) => a.app.localeCompare(b.app) || a.key.localeCompare(b.key));
   }
 
-  /** Write a key to the store. Refused when the environment pins it. */
-  async set(key: string, value: string): Promise<void> {
-    if (this.isOverridden(key)) throw new SettingOverriddenError(key);
+  /** Write a key to the store. */
+  async set(key: string, value: string, app: string = SETTINGS_SCOPE): Promise<void> {
+    // Serialize Identity writes so two concurrent creates cannot both see an absent row.
+    const operation = SettingsStore.writes.then(() => this.write(key, value, app));
+    SettingsStore.writes = operation.catch(() => {});
+    return operation;
+  }
+
+  private async write(key: string, value: string, app: string): Promise<void> {
+    if (!isManagedScope(app)) throw new SettingScopeError(app);
+    if (!isConsoleManaged(key)) throw new SettingUnmanagedError(key);
+    // The store's own rule, enforced rather than just documented: a secret in
+    // '*' is readable by every application that can reach PlatformConfig.
+    if (app === '*' && isSecretKey(key)) throw new SettingScopeError('*', key);
     const { tableId } = await this.resolveIds();
     const rows = await this.listRows();
-    const existing = rows.find((r) => r.app === SETTINGS_SCOPE && r.settingKey === key);
-    if (existing) {
+    const existing = rows.find((r) => r.app === app && r.settingKey === key);
+    if (!value.trim()) {
+      if (existing) await this.api('DELETE', `/api/v2/tables/${tableId}/records`, [{ Id: existing.Id }]);
+    } else if (existing) {
       await this.api('PATCH', `/api/v2/tables/${tableId}/records`, [
         { Id: existing.Id, settingValue: value },
       ]);
     } else {
       const known = KNOWN_SETTINGS.find((s) => s.key === key);
       await this.api('POST', `/api/v2/tables/${tableId}/records`, {
-        app: SETTINGS_SCOPE,
+        app,
         settingKey: key,
         settingValue: value,
         description: known?.description ?? '',
-        bSecret: /SECRET|PASSWORD|TOKEN|APP_KEY/.test(key),
+        bSecret: isSecretKey(key),
       });
     }
     this.cache = null; // read-your-writes

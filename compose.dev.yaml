@@ -1,23 +1,28 @@
-# Everything this service needs, in one file.
+# A self-contained local instance: this service plus a MySQL of its own, for
+# development or a throwaway install. A platform deployment uses compose.yaml
+# against the shared MySQL instead.
 #
-# Identity owns its data: the MySQL below is its own, on a private network,
-# and it applies its own schema to it. The only thing it expects to find
-# already running is a NocoDB, which holds the settings table every
-# application on the platform reads.
-#
-# Nothing here has to be filled in by hand. `scripts/install.sh` writes the
-# database passwords into .env once, and the first-run wizard at /setup
-# collects the NocoDB address, the API token and the trusted network from a
-# browser and saves them to the identity-config volume.
+# `scripts/install.sh` writes the database passwords into .env once and brings
+# this up. The first-run wizard at /setup then collects the NocoDB address,
+# the API token and the trusted network from a browser (saved to the
+# identity-config volume) and the database coordinates (host `db`).
+name: identity-dev
+
 services:
   identity:
-    build: .
+    build:
+      context: .
+      args:
+        BUILD_REVISION: ${BUILD_REVISION:?Export Git HEAD before building}
+        SOURCE_DATE_EPOCH: ${SOURCE_DATE_EPOCH:?Export Git committer epoch before building}
+        BUILD_DIRTY: ${BUILD_DIRTY:?Export Git dirty state before building}
     container_name: identity
     hostname: identity
     depends_on:
       db:
         condition: service_healthy
     environment:
+      TZ: ${TZ:-America/Los_Angeles}
       PORT: "3200"
 
       # Where the settings live. Left empty on a fresh install: /setup asks
@@ -27,19 +32,11 @@ services:
       NOCODB_BASE_URL: ${NOCODB_BASE_URL:-}
       NOCODB_API_TOKEN: ${NOCODB_API_TOKEN:-}
 
-      # This app's own database — the service below, not a shared one.
-      # These are pinned deliberately: the coordinates of a container in
-      # this same file are not something a wizard should be asking about.
-      DB_HOST: ${DB_HOST:-db}
-      DB_PORT: ${DB_PORT:-3306}
-      DB_USER: ${DB_USER:-identity}
-      DB_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
-      DB_NAME: ${DB_NAME:-platform_db}
+      # This app's own database is the `db` service below. Its coordinates
+      # are settings rows like everything else: the wizard's database step
+      # takes host `db`, user `identity`, database `platform_db` and the
+      # DB_PASSWORD scripts/install.sh generated in .env.
 
-      # Optional overrides of cfg_tbl_Setting rows. Blank counts as unset,
-      # so leaving these alone keeps the zero-config path: the public base
-      # URL is whatever URL the browser reached this service on, and the
-      # trusted network comes from the settings table.
       # How an application proves it may redeem a handoff code at /api/token.
       #
       # 'cidr' — the default — trusts the network allowlist alone, and never
@@ -52,13 +49,12 @@ services:
       # which is how EchoWeb authenticates. Narrow this back to 'cidr' if the
       # apps ever sit inside the trusted network.
       IDENTITY_APP_AUTH_MODE: ${IDENTITY_APP_AUTH_MODE:-dual}
-      IDENTITY_TRUSTED_NETWORK: ${IDENTITY_TRUSTED_NETWORK:-}
-      APP_BASE_URL: ${APP_BASE_URL:-}
-      PARENT_DOMAIN: ${PARENT_DOMAIN:-}
     volumes:
       # Holds config.json: the address of the settings store, and nothing
       # else. Survives a rebuild, so an instance is set up exactly once.
       - identity-config:/data
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     ports:
       # Loopback only. Public traffic arrives through a reverse proxy on
       # npm_network, which reaches this container as http://identity:3200.
@@ -77,8 +73,11 @@ services:
       MYSQL_DATABASE: ${DB_NAME:-platform_db}
       MYSQL_USER: ${DB_USER:-identity}
       MYSQL_PASSWORD: ${DB_PASSWORD:?missing — run scripts/install.sh once to generate it}
+      TZ: America/Los_Angeles
     volumes:
       - identity-db-data:/var/lib/mysql
+      - /etc/localtime:/etc/localtime:ro
+      - /etc/timezone:/etc/timezone:ro
     healthcheck:
       # identity waits on this: it applies migrations on the first tick after
       # boot, and a MySQL still initialising would only make that retry.
