@@ -41,8 +41,8 @@ export async function createAppSession(
   const token = store.generateId(32);
   await pool.query(
     `INSERT INTO identity_tbl_Session
-    (sSessionId, iUserId, bSuperAdmin, sProvider, sSubject, sAppOrigin)
-    VALUES (?, ?, ?, ?, ?, ?)`,
+    (sSessionId, iUserId, bSuperAdmin, sProvider, sSubject, sAppOrigin, sParentSessionId)
+    VALUES (?, ?, ?, ?, ?, ?, ?)`,
     [
       tokenHash(token),
       auth.iUserId,
@@ -50,6 +50,7 @@ export async function createAppSession(
       auth.sProvider,
       auth.sSubject,
       origin,
+      auth.sParentSessionId ?? null,
     ],
   );
   return token;
@@ -80,16 +81,34 @@ export async function getAppSession(
     dtCreated: new Date(row.dtCreated),
   };
 }
+/**
+ * Signing out of an application signs out of the Identity login it came from
+ * and every other application session issued under that login, so the next
+ * visit to any app asks the person to sign in rather than silently handing
+ * them a new session. Other logins (other browsers, devices) are untouched.
+ * Returns the user and login that ended, or null when nothing was live.
+ */
 export async function revokeAppSession(
   pool: mysql.Pool,
   token: string,
-): Promise<void> {
-  if (!/^[0-9a-f]{64}$/.test(token)) return;
+): Promise<{ iUserId: number; sParentSessionId: string | null } | null> {
+  if (!/^[0-9a-f]{64}$/.test(token)) return null;
+  const hash = tokenHash(token);
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT iUserId, sParentSessionId FROM identity_tbl_Session
+    WHERE sSessionId = ? AND sAppOrigin IS NOT NULL AND dtRevoked IS NULL`,
+    [hash],
+  );
+  if (!rows.length) return null;
+  const parent = (rows[0].sParentSessionId as string | null) ?? null;
   await pool.query(
     `UPDATE identity_tbl_Session SET dtRevoked = NOW(3)
-    WHERE sSessionId = ? AND sAppOrigin IS NOT NULL AND dtRevoked IS NULL`,
-    [tokenHash(token)],
+    WHERE dtRevoked IS NULL AND (
+      (sSessionId = ? AND sAppOrigin IS NOT NULL)
+      OR (? IS NOT NULL AND (sSessionId = ? OR sParentSessionId = ?)))`,
+    [hash, parent, parent, parent],
   );
+  return { iUserId: safeId(rows[0].iUserId), sParentSessionId: parent };
 }
 export async function listTenants(
   pool: mysql.Pool,

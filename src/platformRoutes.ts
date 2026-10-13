@@ -9,6 +9,7 @@ import {
   phoneNumberInput,
 } from "./phoneNumbers";
 import { manageMember } from "./memberManagement";
+import { emitEvent } from "./webhooks";
 
 type Trust = (req: express.Request, res: express.Response) => Promise<unknown>;
 const tenantInput = z
@@ -120,7 +121,15 @@ export function installPlatformRoutes(
     "/sessions/revoke",
     route(async (req, res) => {
       const { token } = tokenInput.parse(req.body);
-      await platform.revokeAppSession(db, token);
+      const ended = await platform.revokeAppSession(db, token);
+      if (ended)
+        await emitEvent(db, "session.revoked", {
+          iUserId: ended.iUserId,
+          scope: "one",
+          ...(ended.sParentSessionId
+            ? { sessionId: ended.sParentSessionId }
+            : {}),
+        });
       res.json({ revoked: true });
     }),
   );
