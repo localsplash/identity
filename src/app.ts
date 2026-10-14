@@ -348,6 +348,7 @@ export function buildApp() {
           provider: params.provider,
           subject: params.subject,
           bSuperAdmin: params.superAdmin,
+          parentSessionId: sessionId,
         });
         const url = new URL(redirectUri);
         url.searchParams.set("code", code);
@@ -370,6 +371,7 @@ export function buildApp() {
         provider: params.provider,
         subject: params.subject,
         bSuperAdmin: params.superAdmin,
+        parentSessionId: sessionId,
       });
       const url = new URL(fallback);
       url.searchParams.set("code", code);
@@ -1130,6 +1132,7 @@ export function buildApp() {
           provider: session.sProvider,
           subject: session.sSubject,
           bSuperAdmin: session.bSuperAdmin,
+          parentSessionId: session.sSessionId,
         });
         const url = new URL(redirectUri);
         url.searchParams.set("code", code);
@@ -1701,8 +1704,8 @@ export function buildApp() {
     }
   });
 
-  // Revoke this session (sign out of id — apps keep their own sessions).
-  // GET is accepted too: applications end their own session and then send
+  // Revoke this login and the app sessions it handed out (signing out here
+  // signs this browser out of every app). GET is accepted too: applications end their own session and then send
   // the browser here so "sign out" ends the domain-wide login as well.
   const logoutHandler: express.RequestHandler = async (req, res, next) => {
     try {
@@ -1710,8 +1713,7 @@ export function buildApp() {
       const session = await resolveSession(req);
       if (session) {
         await store.revokeSession(db, session.sSessionId);
-        // The app sessions this login spawned are independent of ours, so
-        // signing out here only means anything if the apps hear about it.
+        // Apps that cache sessions locally hear about it too.
         await emitEvent(db, "session.revoked", {
           iUserId: session.iUserId,
           scope: "one",

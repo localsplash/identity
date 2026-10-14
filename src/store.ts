@@ -213,13 +213,15 @@ export async function getSession(
   };
 }
 
+/** Ends an Identity login and every application session handed out under it. */
 export async function revokeSession(
   pool: mysql.Pool,
   sessionId: string,
 ): Promise<void> {
   await pool.query(
-    `UPDATE identity_tbl_Session SET dtRevoked = NOW(3) WHERE sSessionId = ? AND dtRevoked IS NULL`,
-    [sessionId],
+    `UPDATE identity_tbl_Session SET dtRevoked = NOW(3)
+      WHERE (sSessionId = ? OR sParentSessionId = ?) AND dtRevoked IS NULL`,
+    [sessionId, sessionId],
   );
 }
 
@@ -246,13 +248,15 @@ export async function createAuthCode(
     provider: string | null;
     subject: string | null;
     bSuperAdmin: boolean;
+    /** The Identity login this code is issued under. */
+    parentSessionId: string;
   },
 ): Promise<string> {
   const code = generateId(32);
   await pool.query(
     `INSERT INTO identity_tbl_AuthCode
-       (sCode, iUserId, sRedirectUri, sProvider, sSubject, bSuperAdmin, dtExpires)
-     VALUES (?, ?, ?, ?, ?, ?, ?)`,
+       (sCode, iUserId, sRedirectUri, sProvider, sSubject, bSuperAdmin, dtExpires, sParentSessionId)
+     VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
     [
       code,
       params.iUserId,
@@ -261,6 +265,7 @@ export async function createAuthCode(
       params.subject,
       params.bSuperAdmin ? 1 : 0,
       toMySQLDateTime(new Date(Date.now() + AUTH_CODE_TTL_MS)),
+      params.parentSessionId,
     ],
   );
   return code;
@@ -271,6 +276,7 @@ export interface ConsumedAuthCode {
   sProvider: string | null;
   sSubject: string | null;
   bSuperAdmin: boolean;
+  sParentSessionId?: string | null;
 }
 
 /**
@@ -291,8 +297,8 @@ export async function consumeAuthCode(
   );
   if (result.affectedRows !== 1) return null;
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT c.iUserId,c.sProvider,c.sSubject,COALESCE(u.bSuperAdminOverride,c.bSuperAdmin) AS bSuperAdmin
-       FROM identity_tbl_AuthCode c JOIN identity_tbl_User u ON u.iUserId=c.iUserId WHERE c.sCode = ?`,
+    `SELECT c.iUserId,c.sProvider,c.sSubject,COALESCE(u.bSuperAdminOverride,c.bSuperAdmin) AS bSuperAdmin,
+       c.sParentSessionId FROM identity_tbl_AuthCode c JOIN identity_tbl_User u ON u.iUserId=c.iUserId WHERE c.sCode = ?`,
     [code],
   );
   if (!rows.length) return null;
@@ -301,6 +307,7 @@ export async function consumeAuthCode(
     sProvider: (rows[0].sProvider as string) ?? null,
     sSubject: (rows[0].sSubject as string) ?? null,
     bSuperAdmin: Boolean(rows[0].bSuperAdmin),
+    sParentSessionId: (rows[0].sParentSessionId as string) ?? null,
   };
 }
 

@@ -300,6 +300,46 @@ describe.skipIf(!url)("platform authority (isolated MySQL)", () => {
     await store.revokeAllSessions(pool, bobId);
     expect((await introspect(bobToken)).body).toEqual({ active: false });
   });
+  it("signing out of one app or of Identity ends that login everywhere, and only that login", async () => {
+    const userId = await store.createUser(pool, "carol@x.tld", "Carol");
+    const appSession = async (parent: string, origin: string) => {
+      const code = await store.createAuthCode(pool, {
+        iUserId: userId,
+        redirectUri: `${origin}/cb`,
+        provider: "google",
+        subject: "carol",
+        bSuperAdmin: false,
+        parentSessionId: parent,
+      });
+      const consumed = (await store.consumeAuthCode(pool, code, `${origin}/cb`))!;
+      expect(consumed.sParentSessionId).toBe(parent);
+      return p.createAppSession(pool, consumed, origin);
+    };
+    const live = async (token: string) =>
+      (await introspect(token)).body.active === true;
+
+    // Laptop login with Echo and AidaAdmin; phone login with Echo.
+    const laptop = await store.createSession(pool, userId, false, "google", "carol");
+    const phone = await store.createSession(pool, userId, false, "google", "carol");
+    const echo = await appSession(laptop, "https://echo.x.tld");
+    const admin = await appSession(laptop, "https://aida.x.tld");
+    const phoneEcho = await appSession(phone, "https://echo.x.tld");
+
+    // Echo's sign-out ends the laptop login and AidaAdmin with it.
+    await request(app)
+      .post("/api/sessions/revoke")
+      .set("X-Test-Server", "trusted")
+      .send({ token: echo });
+    expect(await live(echo)).toBe(false);
+    expect(await live(admin)).toBe(false);
+    expect(await store.getSession(pool, laptop)).toBeNull();
+    expect(await live(phoneEcho)).toBe(true);
+    expect(await store.getSession(pool, phone)).not.toBeNull();
+
+    // Identity's own sign-out ends the apps opened from that login.
+    await store.revokeSession(pool, phone);
+    expect(await live(phoneEcho)).toBe(false);
+  });
   it("rejects unsafe IDs and invalid membership roles", async () => {
     expect(
       (

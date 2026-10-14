@@ -18,7 +18,7 @@ All following APIs require trusted server admission, using the existing `IDENTIT
 | Endpoint | Body / result |
 | --- | --- |
 | `POST /api/sessions/introspect` | `{token}` → `{active:false}` or the active shape below |
-| `POST /api/sessions/revoke` | `{token}` → `{revoked:true}`; idempotent |
+| `POST /api/sessions/revoke` | `{token}` → `{revoked:true}`; idempotent. Also ends the Identity login the token was issued under and every other app session from that login, so the browser is signed out of all apps. Signing out at Identity (`/logout`) ends that login's app sessions the same way. |
 | `POST /api/sessions/select-tenant` | `{token,iTenantId:number|null}` → `{selectedTenantId:number|null}` |
 | `GET /api/runtime/tenants/:id` | `{iTenantId,bEnabled}` only; 404 for unknown tenant; no actor needed |
 

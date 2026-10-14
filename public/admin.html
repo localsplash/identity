@@ -59,8 +59,9 @@
       </div>
       <p class="text-xs text-slate-500 mb-4">
         Apps register one endpoint and id pushes signed events to it — no polling,
-        no cron. Sessions in each app are independent of the id session, so an app
-        that is not listening will keep people signed in after you revoke them here.
+        no cron. Signing out of id or of any app ends that browser's login and every
+        app session issued under it; apps that keep their own copy of a session
+        rely on these events to drop it.
       </p>
 
       <div id="spec" class="hidden mb-4 rounded-xl bg-slate-50 border border-slate-200 p-4 text-xs text-slate-600 space-y-2">
