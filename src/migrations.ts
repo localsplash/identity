@@ -232,6 +232,34 @@ async function userRoleOverride(conn: mysql.PoolConnection): Promise<void> {
     );
 }
 
+/**
+ * An application session remembers the Identity login it was handed out
+ * under, so signing out of one (in an app or here) ends the other and every
+ * sibling app session from the same login. Sessions issued before this have
+ * no parent and keep the old, independent behaviour until they are replaced.
+ */
+async function sessionParent(conn: mysql.PoolConnection): Promise<void> {
+  for (const table of ["identity_tbl_Session", "identity_tbl_AuthCode"]) {
+    const [rows] = await conn.query<mysql.RowDataPacket[]>(
+      `SELECT COLUMN_NAME FROM information_schema.columns
+        WHERE table_schema=DATABASE() AND table_name=? AND column_name='sParentSessionId'`,
+      [table],
+    );
+    if (!rows.length)
+      await conn.query(
+        `ALTER TABLE ${table} ADD COLUMN sParentSessionId CHAR(64) NULL`,
+      );
+  }
+  const [index] = await conn.query<mysql.RowDataPacket[]>(
+    `SELECT INDEX_NAME FROM information_schema.statistics
+      WHERE table_schema=DATABASE() AND table_name='identity_tbl_Session' AND index_name='idx_session_parent'`,
+  );
+  if (!index.length)
+    await conn.query(
+      `ALTER TABLE identity_tbl_Session ADD INDEX idx_session_parent (sParentSessionId)`,
+    );
+}
+
 async function sharedPhoneNumbers(conn: mysql.PoolConnection): Promise<void> {
   await conn.query(`CREATE TABLE IF NOT EXISTS identity_tbl_PhoneNumber (
     iPhoneNumberId BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
@@ -258,6 +286,7 @@ export const MIGRATIONS: Migration[] = [
   { name: "0003_platform_directory_sessions", run: platformDirectory },
   { name: "0004_user_role_override", run: userRoleOverride },
   { name: "0005_shared_phone_numbers", run: sharedPhoneNumbers },
+  { name: "0006_session_parent", run: sessionParent },
 ];
 
 const MIGRATION_LOCK = "identity_db_migrations";
