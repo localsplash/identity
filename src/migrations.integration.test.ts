@@ -50,7 +50,7 @@ suite('id_db migrations (real MySQL)', () => {
     const tables = await tableNames();
     for (const t of [
       'identity_tbl_User',
-      'identity_tbl_Identity',
+      'identity_tbl_SignIn',
       'identity_tbl_Session',
       'identity_tbl_AuthCode',
       'identity_tbl_App',
@@ -95,6 +95,59 @@ suite('id_db migrations (real MySQL)', () => {
     expect(after[0].iUserId).toBe(iUserId);
     expect(after[0].displayName).toBe('Ada');
 
+    expect(await runMigrations(pool)).toEqual([]);
+  });
+
+  it('0007 merges users sharing an address and renames the sign-in table', async () => {
+    await pool.query(`DROP DATABASE \`${dbName}\``);
+    await pool.query(`CREATE DATABASE \`${dbName}\``);
+    await pool.query(`USE \`${dbName}\``);
+    const conn = await pool.getConnection();
+    try {
+      await conn.query(`USE \`${dbName}\``);
+      await conn.query(
+        `CREATE TABLE identity_tbl_Migration (sName VARCHAR(128) PRIMARY KEY,
+          dtApplied DATETIME(3) NOT NULL DEFAULT CURRENT_TIMESTAMP(3))`
+      );
+      for (const m of MIGRATIONS.slice(0, 6)) {
+        await m.run(conn);
+        await conn.query(`INSERT INTO identity_tbl_Migration (sName) VALUES (?)`, [m.name]);
+      }
+      // An invitation with tenant access, and the same person signed in
+      // separately (unproven Microsoft address) with none.
+      const [t] = await conn.query<mysql.ResultSetHeader>(
+        `INSERT INTO identity_tbl_Tenant (name, slug) VALUES ('A', 'a')`
+      );
+      const [invite] = await conn.query<mysql.ResultSetHeader>(
+        `INSERT INTO identity_tbl_User (email) VALUES ('Bo@Example.test ')`
+      );
+      const [signedIn] = await conn.query<mysql.ResultSetHeader>(
+        `INSERT INTO identity_tbl_User (email, displayName) VALUES ('bo@example.test', 'Bo')`
+      );
+      await conn.query(
+        `INSERT INTO identity_tbl_Identity (iUserId, provider, subject) VALUES (?, 'microsoft', 'bo')`,
+        [signedIn.insertId]
+      );
+      await conn.query(
+        `INSERT INTO identity_tbl_Membership (iTenantId, iUserId, role) VALUES (?, ?, 'TENANT_ADMIN')`,
+        [t.insertId, invite.insertId]
+      );
+    } finally {
+      conn.release();
+    }
+    expect(await runMigrations(pool)).toEqual(['0007_one_user_per_email']);
+    const tables = await tableNames();
+    expect(tables).toContain('identity_tbl_SignIn');
+    expect(tables).not.toContain('identity_tbl_Identity');
+    const [users] = await pool.query<mysql.RowDataPacket[]>(
+      `SELECT u.iUserId, u.email, m.role FROM identity_tbl_User u
+        LEFT JOIN identity_tbl_Membership m ON m.iUserId = u.iUserId`
+    );
+    expect(users).toHaveLength(1);
+    expect(users[0]).toMatchObject({ email: 'bo@example.test', role: 'TENANT_ADMIN' });
+    await expect(
+      pool.query(`INSERT INTO identity_tbl_User (email) VALUES ('bo@example.test')`)
+    ).rejects.toMatchObject({ code: 'ER_DUP_ENTRY' });
     expect(await runMigrations(pool)).toEqual([]);
   });
 });

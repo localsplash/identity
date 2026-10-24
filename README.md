@@ -588,14 +588,32 @@ used and must not be. `identity_db.identity_tbl_User.iUserId` is the platform-wi
 person id; tenant, role, extension, and prompt data belong to the
 applications (e.g. Aida UID mappings in NocoDB), never as columns here.
 
-- `identity_tbl_User` — people
-- `identity_tbl_Identity` — login methods per user (`provider`, `subject`)
+- `identity_tbl_User` — people; one per person. `email` is unique and holds
+  only an address an administrator entered or a provider proved
+- `identity_tbl_SignIn` — the ways each user signs in (`provider`, `subject`;
+  its `email` is a label from the provider). Was `identity_tbl_Identity`
+- `identity_tbl_Tenant` — organizations
+- `identity_tbl_Membership` — who is in which tenant: one row per (tenant,
+  user) with `role` (`TENANT_ADMIN` or `USER`) and `bEnabled`. A user can be
+  in any number of tenants
 - `identity_tbl_Session` — revocable, non-expiring SSO sessions
 - `identity_tbl_AuthCode` — one-time app handoff codes
 - `identity_tbl_App` / `identity_tbl_Event` / `identity_tbl_Delivery` — app registry & events
 - `identity_tbl_SsoNonce` — UISP bridge replay guard
 - `identity_tbl_DirectoryKey` — directory-ensure idempotency keys
 - `identity_tbl_Migration` — applied-migration history
+
+**How a person gets access.** An administrator adds an email to a tenant
+(AidaAdmin → tenant → Users). If no user owns that address yet, Identity
+creates one that has not signed in ("Awaiting first sign-in"). The person's
+first sign-in claims it when the provider proves the address: Google, a
+personal Microsoft account, a tenant-locked Microsoft app, or a Microsoft
+work account whose token carries the optional `xms_edov` claim. A sign-in
+whose address is not proven (e.g. a work account under `common` without
+`xms_edov`, or the UISP portal) gets its own user with no email; linking a
+proving sign-in on the account page later folds the invitation in, or a
+Super Admin can use **Merge into…**. Removing someone who never signed in
+from their only tenant deletes them.
 
 **Where its coordinates come from.** `DB_HOST` / `DB_PORT` / `DB_USER` /
 `DB_PASSWORD` / `DB_NAME` are settings like any other — rows in

@@ -41,7 +41,7 @@ jobs:
           node-version: 22
           cache: npm
       - run: npm ci
-      - run: npx vitest run src/migrations.integration.test.ts src/platform.integration.test.ts
+      - run: npx vitest run src/migrations.integration.test.ts src/platform.integration.test.ts src/memberManagement.integration.test.ts
         env:
           TEST_DB_URL: mysql://root:citest@127.0.0.1:3306/id_db_migration_test
 

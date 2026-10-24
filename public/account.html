@@ -32,6 +32,11 @@
 
     <div id="banner" class="hidden mb-4 px-4 py-3 rounded-xl text-sm"></div>
 
+    <div id="access" class="hidden mb-6">
+      <h2 class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Organizations</h2>
+      <div id="tenants" class="space-y-1.5 text-sm"></div>
+    </div>
+
     <h2 class="text-xs font-semibold text-slate-500 uppercase tracking-wider mb-2">Sign-in methods</h2>
     <div id="identities" class="space-y-1.5 mb-4"></div>
 
@@ -66,6 +71,29 @@
 
       document.getElementById('who').textContent = me.displayName || me.email || 'Your account';
       if (me.superAdmin) document.getElementById('adminLink').classList.remove('hidden');
+
+      // Signed in but in no organization: say why the apps show nothing.
+      const tenants = document.getElementById('tenants');
+      tenants.innerHTML = '';
+      if (!me.superAdmin) {
+        document.getElementById('access').classList.remove('hidden');
+        for (const t of me.tenants || []) {
+          const row = document.createElement('div');
+          row.className = 'px-3 py-2 rounded-lg bg-slate-50 text-slate-700';
+          row.textContent = `${t.name} · ${t.role === 'TENANT_ADMIN' ? 'Tenant Admin' : 'User'}`;
+          tenants.appendChild(row);
+        }
+        if (!(me.tenants || []).length) {
+          const note = document.createElement('p');
+          note.className = 'px-3 py-2 rounded-lg bg-amber-50 border border-amber-200 text-amber-800';
+          note.textContent = me.email
+            ? `You haven't been added to an organization yet. Ask your administrator to add ${me.email}.`
+            : "You haven't been added to an organization yet, and your sign-in provider didn't confirm " +
+              'your email address, so an administrator cannot add you by email. Link a Google or personal ' +
+              'Microsoft account below, or ask your administrator to link this account for you.';
+          tenants.appendChild(note);
+        }
+      }
 
       const wrap = document.getElementById('identities');
       wrap.innerHTML = '';

@@ -65,7 +65,7 @@ import {
   writeLocalConfig,
 } from "./localConfig";
 import * as store from "./store";
-import { createAppSession, safeId } from "./platform";
+import { createAppSession, listTenants, safeId } from "./platform";
 import { installPlatformRoutes } from "./platformRoutes";
 import { parseCidrList, resolveClientIp, ipInCidrs } from "./net";
 import { emitEvent, FAILING_THRESHOLD, EVENT_TYPES } from "./webhooks";
@@ -383,25 +383,32 @@ export function buildApp() {
   }
 
   /**
-   * Map a provider identity onto an id user. Match by (provider, subject)
-   * first; when the provider vouches for the address (trustEmail), fall
-   * back to matching an existing user by email so a person's different
-   * logins converge on one account. Unverified addresses never auto-link —
-   * they create a fresh user unless linked explicitly from the account page.
+   * Map a provider sign-in onto an id user. Match by (provider, subject)
+   * first. When the address is proven for this sign-in (the provider vouches
+   * for it, or says so for this account) fall back to the user who owns that
+   * address — which is how a person an administrator added by email claims
+   * that user on their first sign-in, and how a person's different sign-ins
+   * converge on one account. An unproven address never matches and is never
+   * stored on the user (only on the sign-in, as a label): otherwise anyone
+   * able to mint the claim could inherit access granted to that address.
    */
   async function upsertUserForIdentity(
     providerId: string,
     trustEmail: boolean,
     userInfo: OAuthUserInfo,
   ): Promise<number> {
+    const email = userInfo.email ? store.normalizeEmail(userInfo.email) : "";
+    const proven =
+      Boolean(email) &&
+      (trustEmail
+        ? userInfo.emailVerified !== false
+        : userInfo.emailVerified === true);
     let iUserId = await store.findUserByIdentity(db, providerId, userInfo.sub);
-    if (!iUserId && trustEmail && userInfo.email) {
-      iUserId = await store.findUserByEmail(db, userInfo.email);
-    }
+    if (!iUserId && proven) iUserId = await store.findUserByEmail(db, email);
     if (!iUserId) {
       iUserId = await store.createUser(
         db,
-        userInfo.email || null,
+        proven ? email : null,
         userInfo.name || null,
       );
     }
@@ -410,13 +417,16 @@ export function buildApp() {
       iUserId,
       providerId,
       userInfo.sub,
-      userInfo.email || null,
+      email || null,
     );
-    if (trustEmail && userInfo.email)
-      await db.query(
-        `UPDATE identity_tbl_User SET email=COALESCE(email,?) WHERE iUserId=?`,
-        [userInfo.email.trim().toLowerCase(), iUserId],
-      );
+    if (proven) {
+      const invite = await store.claimEmail(db, iUserId, email);
+      if (invite !== null)
+        await emitEvent(db, "user.merged", {
+          fromUserId: invite,
+          toUserId: iUserId,
+        });
+    }
     return iUserId;
   }
 
@@ -1270,10 +1280,23 @@ export function buildApp() {
           userInfo.sub,
           userInfo.email,
         );
-        await db.query(
-          `UPDATE identity_tbl_User SET email = COALESCE(email, ?) WHERE iUserId = ?`,
-          [userInfo.email, linkSession.iUserId],
-        );
+        if (
+          userInfo.email &&
+          (provider.verifiesEmailDomain(settings)
+            ? userInfo.emailVerified !== false
+            : userInfo.emailVerified === true)
+        ) {
+          const invite = await store.claimEmail(
+            db,
+            linkSession.iUserId,
+            userInfo.email,
+          );
+          if (invite !== null)
+            await emitEvent(db, "user.merged", {
+              fromUserId: invite,
+              toUserId: linkSession.iUserId,
+            });
+        }
         await emitEvent(db, "identity.linked", {
           iUserId: linkSession.iUserId,
           provider: provider.id,
@@ -1663,6 +1686,17 @@ export function buildApp() {
         linkable: availableLoginMethods(settings)
           .filter((m) => m.kind === "oauth")
           .map((m) => ({ id: m.id, label: m.label })),
+        // Which organizations this person can use, so someone who signed in
+        // but was never added sees why the apps let them nowhere.
+        tenants: session.bSuperAdmin
+          ? []
+          : (
+              await listTenants(db, {
+                ...session,
+                sAppOrigin: "",
+                iSelectedTenantId: null,
+              })
+            ).map((t) => ({ name: t.name, role: t.role })),
       });
     } catch (err) {
       next(err);

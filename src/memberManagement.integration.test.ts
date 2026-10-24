@@ -3,7 +3,7 @@ import mysql from "mysql2/promise";
 import { runMigrations } from "./migrations";
 import * as store from "./store";
 import * as platform from "./platform";
-import { manageMember } from "./memberManagement";
+import { manageMember, removeMember } from "./memberManagement";
 
 const url = process.env.TEST_DB_URL;
 describe.skipIf(!url)("central role hierarchy on MySQL", () => {
@@ -191,39 +191,156 @@ describe.skipIf(!url)("central role hierarchy on MySQL", () => {
       }),
     ).rejects.toMatchObject({ status: 403 });
   });
-  it("finds imported Google accounts by their sign-in email rather than creating a duplicate", async () => {
-    const imported = await store.createUser(pool, null, "Imported");
+  it("keeps one user per email and lets a proven sign-in claim an invitation", async () => {
+    await expect(
+      store.createUser(pool, "user@example.test", "Second"),
+    ).rejects.toMatchObject({ code: "ER_DUP_ENTRY" });
+    // Signed in first with an unproven address: no email on the user.
+    const signedIn = await store.createUser(pool, null, "Signed In");
     await store.ensureIdentity(
       pool,
-      imported,
-      "google",
-      "existing-google",
-      "imported@example.test",
+      signedIn,
+      "microsoft",
+      "work",
+      "late@example.test",
     );
-    const found = await store.ensureDirectoryUser(pool, {
-      email: "imported@example.test",
+    const invite = await store.ensureDirectoryUser(pool, {
+      email: "late@example.test",
       displayName: null,
       idempotencyKey: null,
     });
-    expect(found.iUserId).toBe(imported);
-    expect(await store.findUserByEmail(pool, "imported@example.test")).toBe(
-      imported,
+    expect(invite.iUserId).not.toBe(signedIn);
+    await platform.setMembership(
+      pool,
+      rootActor,
+      a,
+      invite.iUserId,
+      "USER",
+      true,
     );
-    expect((await store.getUser(pool, imported))!.email).toBe(
-      "imported@example.test",
+    // Later proves the address (e.g. links Google): the invitation folds in.
+    expect(await store.claimEmail(pool, signedIn, "late@example.test")).toBe(
+      invite.iUserId,
     );
-    await pool.query(
-      "UPDATE identity_tbl_User SET email=NULL WHERE iUserId=?",
-      [imported],
+    expect(await store.getUser(pool, invite.iUserId)).toBeNull();
+    expect((await store.getUser(pool, signedIn))!.email).toBe(
+      "late@example.test",
     );
-    await store.createUser(pool, "imported@example.test", "Duplicate");
+    expect(
+      (await platform.listMemberships(pool, a)).some(
+        (m) => m.iUserId === signedIn,
+      ),
+    ).toBe(true);
+  });
+  it("refuses to add someone already in the tenant, with a message that says so", async () => {
     await expect(
-      store.ensureDirectoryUser(pool, {
-        email: "imported@example.test",
-        displayName: null,
-        idempotencyKey: null,
+      manageMember(
+        pool,
+        adminActor,
+        a,
+        user,
+        { role: "USER", bEnabled: true },
+        { newMember: true },
+      ),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining(
+        "user@example.test is already in this tenant as User",
+      ),
+    });
+    // The last-admin rule is about removing an admin, never about adding.
+    await expect(
+      manageMember(
+        pool,
+        adminActor,
+        a,
+        tenantAdmin,
+        { role: "USER", bEnabled: true },
+        { newMember: true },
+      ),
+    ).rejects.toMatchObject({
+      message: expect.stringContaining("already in this tenant"),
+    });
+  });
+  it("Super Admins may leave a tenant without a Tenant Admin; Tenant Admins may not", async () => {
+    await expect(
+      removeMember(pool, adminActor, a, tenantAdmin),
+    ).rejects.toMatchObject({
+      status: 409,
+      message: expect.stringContaining("only Tenant Admin"),
+    });
+    await manageMember(pool, rootActor, a, tenantAdmin, {
+      role: "USER",
+      bEnabled: true,
+    });
+  });
+  it("removes members, deleting users who were only an invitation", async () => {
+    const invite = await store.ensureDirectoryUser(pool, {
+      email: "invite@example.test",
+      displayName: null,
+      idempotencyKey: null,
+    });
+    await manageMember(
+      pool,
+      adminActor,
+      a,
+      invite.iUserId,
+      { role: "USER", bEnabled: true },
+      { newMember: true },
+    );
+    expect(await removeMember(pool, adminActor, a, invite.iUserId)).toEqual({
+      userDeleted: true,
+    });
+    expect(await store.getUser(pool, invite.iUserId)).toBeNull();
+    await store.ensureIdentity(
+      pool,
+      user,
+      "google",
+      "user-google",
+      "user@example.test",
+    );
+    expect(await removeMember(pool, adminActor, a, user)).toEqual({
+      userDeleted: false,
+    });
+    expect(await store.getUser(pool, user)).not.toBeNull();
+    await expect(removeMember(pool, adminActor, a, user)).rejects.toMatchObject(
+      {
+        status: 404,
+      },
+    );
+  });
+  it("editing an invitation's email to someone else's address hands the access to them", async () => {
+    const person = await store.createUser(
+      pool,
+      "person@example.test",
+      "Person",
+    );
+    await store.ensureIdentity(
+      pool,
+      person,
+      "google",
+      "person",
+      "person@example.test",
+    );
+    const result = await manageMember(pool, adminActor, a, user, {
+      role: "TENANT_ADMIN",
+      bEnabled: true,
+      email: "person@example.test",
+    });
+    expect(result).toEqual({ iUserId: person, mergedFromUserId: user });
+    expect(await store.getUser(pool, user)).toBeNull();
+    expect(
+      (await platform.listMemberships(pool, a)).find(
+        (m) => m.iUserId === person,
+      )!.membershipRole,
+    ).toBe("TENANT_ADMIN");
+    await expect(
+      manageMember(pool, adminActor, a, person, {
+        role: "USER",
+        bEnabled: true,
+        email: "admin@example.test",
       }),
-    ).rejects.toBeInstanceOf(store.DirectoryConflictError);
+    ).rejects.toMatchObject({ status: 409 });
   });
   it("repairs an unclaimed duplicate while preserving the Google login and tenant role", async () => {
     const imported = await store.createUser(pool, null, "Imported");

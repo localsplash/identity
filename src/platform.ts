@@ -205,7 +205,7 @@ export async function listMemberships(pool: mysql.Pool, id: number) {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT m.iUserId, u.email, u.displayName,m.role,m.bEnabled,
     COALESCE(u.bSuperAdminOverride,EXISTS(SELECT 1 FROM identity_tbl_Session s WHERE s.iUserId=u.iUserId AND s.bSuperAdmin=1 AND s.dtRevoked IS NULL)) AS superAdmin,
-    EXISTS(SELECT 1 FROM identity_tbl_Identity i WHERE i.iUserId=u.iUserId) AS claimed
+    EXISTS(SELECT 1 FROM identity_tbl_SignIn i WHERE i.iUserId=u.iUserId) AS claimed
     FROM identity_tbl_Membership m JOIN identity_tbl_User u ON u.iUserId = m.iUserId WHERE m.iTenantId = ? ORDER BY m.iUserId`,
     [id],
   );

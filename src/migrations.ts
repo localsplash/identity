@@ -1,4 +1,5 @@
 import mysql from "mysql2/promise";
+import { foldUser } from "./store";
 
 /**
  * id_db schema migrations — this repository is the sole schema owner.
@@ -7,7 +8,8 @@ import mysql from "mysql2/promise";
  * Each applied migration is recorded in identity_tbl_Migration, so the history
  * is deterministic: a fresh database runs everything, an existing one runs
  * only what it has not seen, and a second run is a no-op. Migrations must
- * stay additive and idempotent — they run against live data.
+ * stay idempotent — they run against live data — and additive, except
+ * 0007, a one-time pre-launch cleanup that merges users and renames a table.
  *
  * There is no external schema source: EchoDatabase/init is NOT consulted
  * and must not be. Local/dev MySQL remains disposable (docker-compose).
@@ -36,7 +38,9 @@ async function baseline(conn: mysql.PoolConnection): Promise<void> {
     ) ENGINE=InnoDB
   `);
   // provider is VARCHAR, not ENUM — new providers must not need DDL.
-  await conn.query(`
+  // Renamed identity_tbl_SignIn by 0007; a re-run must not recreate it.
+  if (!(await tableExists(conn, "identity_tbl_SignIn")))
+    await conn.query(`
     CREATE TABLE IF NOT EXISTS identity_tbl_Identity (
       iIdentityId BIGINT AUTO_INCREMENT PRIMARY KEY,
       iUserId     BIGINT NOT NULL,
@@ -279,6 +283,61 @@ async function sharedPhoneNumbers(conn: mysql.PoolConnection): Promise<void> {
   ) ENGINE=InnoDB`);
 }
 
+/**
+ * One person, one user, one address.
+ *
+ * Before this, an address could sit on several users — typically a user an
+ * administrator added by email (with the tenant access) and a second user
+ * created when that person signed in with a provider whose address was not
+ * trusted (the one they are actually signed in as, with no access). Users
+ * sharing an address are merged here into the one that has sign-ins (oldest
+ * first), keeping every tenant, the stronger role and enabled if either was;
+ * then the address becomes unique. identity_tbl_Identity, which was easy to
+ * confuse with the user itself, becomes identity_tbl_SignIn: one row per way
+ * a user signs in (Google, Microsoft, ISP account).
+ */
+async function oneUserPerEmail(conn: mysql.PoolConnection): Promise<void> {
+  await conn.query(
+    `UPDATE identity_tbl_User SET email = NULLIF(LOWER(TRIM(email)), '')
+      WHERE email IS NOT NULL`,
+  );
+  if (
+    (await tableExists(conn, "identity_tbl_Identity")) &&
+    !(await tableExists(conn, "identity_tbl_SignIn"))
+  )
+    await conn.query(
+      "RENAME TABLE identity_tbl_Identity TO identity_tbl_SignIn",
+    );
+  const [dupes] = await conn.query<mysql.RowDataPacket[]>(
+    `SELECT email FROM identity_tbl_User WHERE email IS NOT NULL
+      GROUP BY email HAVING COUNT(*) > 1`,
+  );
+  for (const { email } of dupes) {
+    const [users] = await conn.query<mysql.RowDataPacket[]>(
+      `SELECT u.iUserId FROM identity_tbl_User u WHERE u.email = ?
+        ORDER BY EXISTS(SELECT 1 FROM identity_tbl_SignIn i WHERE i.iUserId = u.iUserId) DESC, u.iUserId`,
+      [email],
+    );
+    const keep = Number(users[0].iUserId);
+    for (const other of users.slice(1))
+      await foldUser(conn, Number(other.iUserId), keep, {
+        combineMemberships: true,
+      });
+  }
+  const [indexes] = await conn.query<mysql.RowDataPacket[]>(
+    `SELECT INDEX_NAME FROM information_schema.statistics
+      WHERE table_schema = DATABASE() AND table_name = 'identity_tbl_User'
+        AND index_name IN ('idx_email', 'uq_user_email')`,
+  );
+  const names = new Set(indexes.map((r) => String(r.INDEX_NAME)));
+  if (!names.has("uq_user_email"))
+    await conn.query(
+      "ALTER TABLE identity_tbl_User ADD UNIQUE INDEX uq_user_email (email)",
+    );
+  if (names.has("idx_email"))
+    await conn.query("ALTER TABLE identity_tbl_User DROP INDEX idx_email");
+}
+
 /** Ordered, append-only. Never rename or reorder an entry once released. */
 export const MIGRATIONS: Migration[] = [
   { name: "0001_baseline", run: baseline },
@@ -287,6 +346,7 @@ export const MIGRATIONS: Migration[] = [
   { name: "0004_user_role_override", run: userRoleOverride },
   { name: "0005_shared_phone_numbers", run: sharedPhoneNumbers },
   { name: "0006_session_parent", run: sessionParent },
+  { name: "0007_one_user_per_email", run: oneUserPerEmail },
 ];
 
 const MIGRATION_LOCK = "identity_db_migrations";
