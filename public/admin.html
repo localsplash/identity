@@ -273,6 +273,16 @@ X-Id-Signature: sha256=&lt;hex&gt;
           <span class="text-xs text-slate-500">${u.activeSessions} active session(s)</span>`;
         div.appendChild(head);
 
+        const access = document.createElement('div');
+        access.className = 'text-xs text-slate-500 mb-1';
+        access.textContent = u.tenants.length
+          ? 'Tenants: ' + u.tenants.map((t) =>
+              `${t.name} (${t.role === 'TENANT_ADMIN' ? 'Tenant Admin' : 'User'}${t.bEnabled ? '' : ', disabled'})`
+            ).join(', ')
+          : 'No tenant access';
+        if (!u.identities.length) access.textContent += ' · has not signed in yet';
+        div.appendChild(access);
+
         for (const i of u.identities) {
           const row = document.createElement('div');
           row.className = 'flex items-center justify-between text-xs text-slate-600 py-1';

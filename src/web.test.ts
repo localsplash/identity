@@ -270,6 +270,24 @@ describe('parseMicrosoftIdToken', () => {
     expect(info).toEqual({ sub: 'sub-123', email: 'ada@contoso.com', name: 'Ada' });
   });
 
+  it('treats a personal Microsoft account address as proven', () => {
+    const info = parseMicrosoftIdToken(
+      idToken({
+        sub: 's',
+        name: 'Bo',
+        preferred_username: 'bo@hotmail.com',
+        tid: '9188040d-6c67-4c5b-b112-36a304b66dad',
+      })
+    );
+    expect(info?.emailVerified).toBe(true);
+  });
+
+  it('treats a work address as proven only with xms_edov', () => {
+    const work = { sub: 's', email: 'ada@contoso.com', tid: '11111111-2222-3333-4444-555555555555' };
+    expect(parseMicrosoftIdToken(idToken(work))?.emailVerified).toBeUndefined();
+    expect(parseMicrosoftIdToken(idToken({ ...work, xms_edov: true }))?.emailVerified).toBe(true);
+  });
+
   it('rejects a token with no usable address or subject', () => {
     expect(parseMicrosoftIdToken(idToken({ sub: 's', name: 'No Mail' }))).toBeNull();
     expect(parseMicrosoftIdToken(idToken({ email: 'a@b.c' }))).toBeNull();
