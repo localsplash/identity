@@ -45,26 +45,51 @@ export async function findUserByIdentity(
   subject: string,
 ): Promise<number | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT iUserId FROM identity_tbl_Identity WHERE provider = ? AND subject = ?`,
+    `SELECT iUserId FROM identity_tbl_SignIn WHERE provider = ? AND subject = ?`,
     [provider, subject],
   );
   return rows.length ? (rows[0].iUserId as number) : null;
 }
 
+/**
+ * The one user who owns this address. identity_tbl_User.email is unique and
+ * holds only addresses an administrator entered or a provider proved, so an
+ * address can never point at two people.
+ */
 export async function findUserByEmail(
-  pool: mysql.Pool,
+  pool: mysql.Pool | mysql.PoolConnection,
   email: string,
 ): Promise<number | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT DISTINCT u.iUserId FROM identity_tbl_User u WHERE u.email = ? OR
-     EXISTS(SELECT 1 FROM identity_tbl_Identity i WHERE i.iUserId=u.iUserId AND i.provider='google' AND i.email=?) LIMIT 2`,
-    [email.trim().toLowerCase(), email.trim().toLowerCase()],
+    `SELECT iUserId FROM identity_tbl_User WHERE email = ?`,
+    [normalizeEmail(email)],
   );
-  if (rows.length > 1)
-    throw new DirectoryConflictError(
-      "Multiple accounts use this email; reconcile their identities",
-    );
   return rows.length ? (rows[0].iUserId as number) : null;
+}
+
+export function normalizeEmail(email: string): string {
+  return email.trim().toLowerCase();
+}
+
+/**
+ * Give a user a proven address when they have none and nobody else holds
+ * it. Returns false when it was not set (already has one, or taken).
+ */
+export async function setEmailIfFree(
+  pool: mysql.Pool | mysql.PoolConnection,
+  iUserId: number,
+  email: string,
+): Promise<boolean> {
+  try {
+    const [r] = await pool.query<mysql.ResultSetHeader>(
+      `UPDATE identity_tbl_User SET email = ? WHERE iUserId = ? AND email IS NULL`,
+      [normalizeEmail(email), iUserId],
+    );
+    return r.affectedRows === 1;
+  } catch (e) {
+    if ((e as { code?: string }).code === "ER_DUP_ENTRY") return false;
+    throw e;
+  }
 }
 
 export async function getUser(
@@ -110,7 +135,7 @@ export async function ensureIdentity(
   // Refresh the address on re-login so a renamed account doesn't keep its old
   // label, but never overwrite a known one with null.
   await pool.query(
-    `INSERT INTO identity_tbl_Identity (iUserId, provider, subject, email)
+    `INSERT INTO identity_tbl_SignIn (iUserId, provider, subject, email)
      VALUES (?, ?, ?, ?)
      ON DUPLICATE KEY UPDATE email = COALESCE(VALUES(email), email)`,
     [iUserId, provider, subject, email],
@@ -123,7 +148,7 @@ export async function listIdentities(
 ): Promise<IdentityRow[]> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT iIdentityId, iUserId, provider, subject, email, dtCreated
-       FROM identity_tbl_Identity WHERE iUserId = ? ORDER BY dtCreated ASC`,
+       FROM identity_tbl_SignIn WHERE iUserId = ? ORDER BY dtCreated ASC`,
     [iUserId],
   );
   return rows as unknown as IdentityRow[];
@@ -135,7 +160,7 @@ export async function getIdentity(
 ): Promise<IdentityRow | null> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
     `SELECT iIdentityId, iUserId, provider, subject, email, dtCreated
-       FROM identity_tbl_Identity WHERE iIdentityId = ?`,
+       FROM identity_tbl_SignIn WHERE iIdentityId = ?`,
     [iIdentityId],
   );
   return rows.length ? (rows[0] as unknown as IdentityRow) : null;
@@ -145,7 +170,7 @@ export async function deleteIdentity(
   pool: mysql.Pool,
   iIdentityId: number,
 ): Promise<void> {
-  await pool.query(`DELETE FROM identity_tbl_Identity WHERE iIdentityId = ?`, [
+  await pool.query(`DELETE FROM identity_tbl_SignIn WHERE iIdentityId = ?`, [
     iIdentityId,
   ]);
 }
@@ -159,7 +184,7 @@ export async function countIdentities(
   iUserId: number,
 ): Promise<number> {
   const [rows] = await pool.query<mysql.RowDataPacket[]>(
-    `SELECT COUNT(*) n FROM identity_tbl_Identity WHERE iUserId = ?`,
+    `SELECT COUNT(*) n FROM identity_tbl_SignIn WHERE iUserId = ?`,
     [iUserId],
   );
   return Number(rows[0]?.n ?? 0);
@@ -345,6 +370,7 @@ export interface AdminUserView {
     email: string | null;
   }>;
   activeSessions: number;
+  tenants: Array<{ name: string; role: string; bEnabled: boolean }>;
 }
 
 export async function adminListUsers(
@@ -356,7 +382,7 @@ export async function adminListUsers(
             (SELECT COUNT(*) FROM identity_tbl_Session s
               WHERE s.iUserId = u.iUserId AND s.dtRevoked IS NULL) AS activeSessions
        FROM identity_tbl_User u
-       LEFT JOIN identity_tbl_Identity i ON i.iUserId = u.iUserId
+       LEFT JOIN identity_tbl_SignIn i ON i.iUserId = u.iUserId
       ORDER BY u.iUserId, i.provider`,
   );
   const users = new Map<number, AdminUserView>();
@@ -371,6 +397,7 @@ export async function adminListUsers(
         dtLastLogin: r.dtLastLogin ? String(r.dtLastLogin) : null,
         identities: [],
         activeSessions: Number(r.activeSessions ?? 0),
+        tenants: [],
       };
       users.set(user.iUserId, user);
     }
@@ -383,6 +410,16 @@ export async function adminListUsers(
       });
     }
   }
+  const [memberships] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT m.iUserId, t.name, m.role, m.bEnabled FROM identity_tbl_Membership m
+       JOIN identity_tbl_Tenant t ON t.iTenantId = m.iTenantId ORDER BY t.name`,
+  );
+  for (const m of memberships)
+    users.get(m.iUserId as number)?.tenants.push({
+      name: m.name as string,
+      role: m.role as string,
+      bEnabled: Boolean(m.bEnabled),
+    });
   return Array.from(users.values());
 }
 
@@ -529,7 +566,7 @@ export interface DirectoryUser {
 
 const dirUserSelect = `
   SELECT u.iUserId, u.email, u.displayName,
-         EXISTS(SELECT 1 FROM identity_tbl_Identity i WHERE i.iUserId = u.iUserId) AS claimed
+         EXISTS(SELECT 1 FROM identity_tbl_SignIn i WHERE i.iUserId = u.iUserId) AS claimed
     FROM identity_tbl_User u`;
 
 function toDirectoryUser(r: mysql.RowDataPacket): DirectoryUser {
@@ -601,14 +638,9 @@ export async function ensureDirectoryUser(
         }
       }
       const [existing] = await conn.query<mysql.RowDataPacket[]>(
-        `${dirUserSelect} WHERE u.email = ? OR EXISTS(SELECT 1 FROM identity_tbl_Identity i
-        WHERE i.iUserId=u.iUserId AND i.provider='google' AND i.email=?) ORDER BY u.iUserId LIMIT 2`,
-        [email, email],
+        `${dirUserSelect} WHERE u.email = ?`,
+        [email],
       );
-      if (existing.length > 1)
-        throw new DirectoryConflictError(
-          "Email has multiple users; reconcile explicit identities before assigning access",
-        );
       let user: DirectoryUser;
       if (existing.length) user = toDirectoryUser(existing[0]);
       else {
@@ -703,13 +735,77 @@ export async function mergeUsers(
   fromUserId: number,
   toUserId: number,
 ): Promise<MergeResult> {
-  if (fromUserId === toUserId)
-    throw new Error("Cannot merge a user into itself");
-
   const conn = await pool.getConnection();
   try {
     await conn.beginTransaction();
+    const result = await foldUser(conn, fromUserId, toUserId);
+    await conn.commit();
+    return result;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
 
+/**
+ * A signed-in user just proved they own `email`. If an administrator had
+ * added that address as a user nobody has signed in as yet (an invitation),
+ * fold the invitation — and so its tenant access — into this user, then
+ * give this user the address. Returns the folded user's id, if any.
+ */
+export async function claimEmail(
+  pool: mysql.Pool,
+  iUserId: number,
+  email: string,
+): Promise<number | null> {
+  const conn = await pool.getConnection();
+  try {
+    await conn.beginTransaction();
+    const [rows] = await conn.query<mysql.RowDataPacket[]>(
+      `SELECT u.iUserId FROM identity_tbl_User u WHERE u.email = ? AND u.iUserId <> ?
+        AND NOT EXISTS(SELECT 1 FROM identity_tbl_SignIn i WHERE i.iUserId = u.iUserId) FOR UPDATE`,
+      [normalizeEmail(email), iUserId],
+    );
+    const invite = rows.length ? Number(rows[0].iUserId) : null;
+    if (invite !== null)
+      await foldUser(conn, invite, iUserId, { combineMemberships: true });
+    await setEmailIfFree(conn, iUserId, email);
+    await conn.commit();
+    return invite;
+  } catch (err) {
+    await conn.rollback();
+    throw err;
+  } finally {
+    conn.release();
+  }
+}
+
+/**
+ * mergeUsers inside the caller's transaction. With `combineMemberships`, a
+ * tenant both users belong to keeps the stronger role and stays enabled if
+ * either was; without it, such a conflict refuses the merge.
+ */
+export async function foldUser(
+  conn: mysql.PoolConnection,
+  fromUserId: number,
+  toUserId: number,
+  options: { combineMemberships?: boolean } = {},
+): Promise<MergeResult> {
+  if (fromUserId === toUserId)
+    throw new Error("Cannot merge a user into itself");
+
+  if (options.combineMemberships) {
+    await conn.query(
+      `UPDATE identity_tbl_Membership t
+        JOIN identity_tbl_Membership f ON f.iTenantId = t.iTenantId AND f.iUserId = ?
+        SET t.role = IF(t.role = 'TENANT_ADMIN' OR f.role = 'TENANT_ADMIN', 'TENANT_ADMIN', 'USER'),
+            t.bEnabled = GREATEST(t.bEnabled, f.bEnabled)
+        WHERE t.iUserId = ?`,
+      [fromUserId, toUserId],
+    );
+  } else {
     const [conflicts] = await conn.query<mysql.RowDataPacket[]>(
       `SELECT f.iTenantId FROM identity_tbl_Membership f
       JOIN identity_tbl_Membership t ON t.iTenantId = f.iTenantId AND t.iUserId = ?
@@ -720,62 +816,88 @@ export async function mergeUsers(
       throw new Error(
         "Reconcile conflicting tenant memberships before merging users",
       );
-    await conn.query(
-      `INSERT IGNORE INTO identity_tbl_Membership (iTenantId,iUserId,role,bEnabled)
-      SELECT iTenantId,?,role,bEnabled FROM identity_tbl_Membership WHERE iUserId = ?`,
-      [toUserId, fromUserId],
-    );
-    await conn.query(`DELETE FROM identity_tbl_Membership WHERE iUserId = ?`, [
-      fromUserId,
-    ]);
-    await conn.query(
-      `UPDATE identity_tbl_LegacyMap SET iUserId = ? WHERE iUserId = ?`,
-      [toUserId, fromUserId],
-    );
-    await conn.query(
-      `UPDATE identity_tbl_DirectoryKey SET iUserId = ? WHERE iUserId = ?`,
-      [toUserId, fromUserId],
-    );
-
-    const [moved] = await conn.query<mysql.ResultSetHeader>(
-      `UPDATE IGNORE identity_tbl_Identity SET iUserId = ? WHERE iUserId = ?`,
-      [toUserId, fromUserId],
-    );
-    // Whatever IGNORE skipped was a duplicate of an identity the target
-    // already holds; the source row is redundant either way.
-    await conn.query(`DELETE FROM identity_tbl_Identity WHERE iUserId = ?`, [
-      fromUserId,
-    ]);
-
-    const [revoked] = await conn.query<mysql.ResultSetHeader>(
-      `UPDATE identity_tbl_Session SET dtRevoked = NOW(3)
-        WHERE iUserId = ? AND dtRevoked IS NULL`,
-      [fromUserId],
-    );
-
-    // Keep an address on the surviving user if it had none.
-    await conn.query(
-      `UPDATE identity_tbl_User t
-          JOIN identity_tbl_User f ON f.iUserId = ?
-          SET t.email = COALESCE(t.email, f.email),
-              t.displayName = COALESCE(t.displayName, f.displayName)
-        WHERE t.iUserId = ?`,
-      [fromUserId, toUserId],
-    );
-
-    await conn.query(`DELETE FROM identity_tbl_User WHERE iUserId = ?`, [
-      fromUserId,
-    ]);
-    await conn.commit();
-
-    return {
-      movedIdentities: moved.affectedRows,
-      revokedSessions: revoked.affectedRows,
-    };
-  } catch (err) {
-    await conn.rollback();
-    throw err;
-  } finally {
-    conn.release();
   }
+  await conn.query(
+    `INSERT IGNORE INTO identity_tbl_Membership (iTenantId,iUserId,role,bEnabled)
+    SELECT iTenantId,?,role,bEnabled FROM identity_tbl_Membership WHERE iUserId = ?`,
+    [toUserId, fromUserId],
+  );
+  await conn.query(`DELETE FROM identity_tbl_Membership WHERE iUserId = ?`, [
+    fromUserId,
+  ]);
+  await conn.query(
+    `UPDATE identity_tbl_LegacyMap SET iUserId = ? WHERE iUserId = ?`,
+    [toUserId, fromUserId],
+  );
+  await conn.query(
+    `UPDATE identity_tbl_DirectoryKey SET iUserId = ? WHERE iUserId = ?`,
+    [toUserId, fromUserId],
+  );
+
+  const [moved] = await conn.query<mysql.ResultSetHeader>(
+    `UPDATE IGNORE identity_tbl_SignIn SET iUserId = ? WHERE iUserId = ?`,
+    [toUserId, fromUserId],
+  );
+  // Whatever IGNORE skipped was a duplicate of a sign-in the target
+  // already holds; the source row is redundant either way.
+  await conn.query(`DELETE FROM identity_tbl_SignIn WHERE iUserId = ?`, [
+    fromUserId,
+  ]);
+
+  const [revoked] = await conn.query<mysql.ResultSetHeader>(
+    `UPDATE identity_tbl_Session SET dtRevoked = NOW(3)
+      WHERE iUserId = ? AND dtRevoked IS NULL`,
+    [fromUserId],
+  );
+
+  // Keep an address and name on the surviving user if it had none. The
+  // retired user lets go of its address first: email is unique.
+  const [from] = await conn.query<mysql.RowDataPacket[]>(
+    `SELECT email, displayName FROM identity_tbl_User WHERE iUserId = ?`,
+    [fromUserId],
+  );
+  await conn.query(
+    `UPDATE identity_tbl_User SET email = NULL WHERE iUserId = ?`,
+    [fromUserId],
+  );
+  if (from.length)
+    await conn.query(
+      `UPDATE identity_tbl_User
+          SET email = COALESCE(email, ?), displayName = COALESCE(displayName, ?)
+        WHERE iUserId = ?`,
+      [from[0].email ?? null, from[0].displayName ?? null, toUserId],
+    );
+
+  await conn.query(`DELETE FROM identity_tbl_User WHERE iUserId = ?`, [
+    fromUserId,
+  ]);
+  return {
+    movedIdentities: moved.affectedRows,
+    revokedSessions: revoked.affectedRows,
+  };
+}
+
+/**
+ * Delete a user nobody can sign in as and nothing grants access to — an
+ * invitation that was withdrawn or never used. Returns true if deleted.
+ */
+export async function deleteUserIfUnused(
+  pool: mysql.Pool | mysql.PoolConnection,
+  iUserId: number,
+): Promise<boolean> {
+  const [rows] = await pool.query<mysql.RowDataPacket[]>(
+    `SELECT u.iUserId FROM identity_tbl_User u WHERE u.iUserId = ?
+      AND COALESCE(u.bSuperAdminOverride, 0) = 0
+      AND NOT EXISTS(SELECT 1 FROM identity_tbl_SignIn i WHERE i.iUserId = u.iUserId)
+      AND NOT EXISTS(SELECT 1 FROM identity_tbl_Membership m WHERE m.iUserId = u.iUserId)`,
+    [iUserId],
+  );
+  if (!rows.length) return false;
+  await pool.query(`DELETE FROM identity_tbl_LegacyMap WHERE iUserId = ?`, [
+    iUserId,
+  ]);
+  await pool.query(`DELETE FROM identity_tbl_User WHERE iUserId = ?`, [
+    iUserId,
+  ]);
+  return true;
 }

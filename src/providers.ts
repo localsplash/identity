@@ -20,6 +20,14 @@ export interface OAuthUserInfo {
   name: string;
   /** Verified hosted domain, when the provider vouches for one (Google `hd`). */
   hd?: string;
+  /**
+   * The provider vouches that this person owns `email` for this sign-in in
+   * particular (a personal Microsoft account, or an Entra token carrying
+   * xms_edov). Lets the sign-in claim the user an administrator added by
+   * that address. Never grants Super System Admin — that still needs
+   * verifiesEmailDomain.
+   */
+  emailVerified?: boolean;
 }
 
 export interface OAuthState {
@@ -107,6 +115,7 @@ const google: ProviderDescriptor = {
       email: info.email.toLowerCase(),
       name: info.name ?? info.email,
       hd: info.hd,
+      emailVerified: info.email_verified !== false,
     };
   },
 };
@@ -116,6 +125,8 @@ const google: ProviderDescriptor = {
 interface MicrosoftIdTokenClaims {
   sub?: string;
   name?: string;
+  tid?: string;
+  xms_edov?: boolean | string;
   email?: string;
   preferred_username?: string;
 }
@@ -143,6 +154,12 @@ function microsoftAuthority(settings: Settings): string {
  * NOTE: Entra's email claim is set by the user's own tenant and is not proof
  * of address ownership, which is why this provider has
  * verifiesEmailDomain=false and can never grant Super System Admin.
+ *
+ * The address is still proven for one sign-in when the account is a personal
+ * Microsoft account (Microsoft owns that tenant and the address is the
+ * account's own sign-in name), or when the token carries xms_edov=true (the
+ * optional "email domain owner verified" claim, added in the app
+ * registration's Token configuration).
  */
 export function parseMicrosoftIdToken(idToken: string): OAuthUserInfo | null {
   const claims = decodeJwtPayload(idToken) as MicrosoftIdTokenClaims | null;
@@ -154,8 +171,23 @@ export function parseMicrosoftIdToken(idToken: string): OAuthUserInfo | null {
   const email = candidate.includes('@') ? candidate.toLowerCase() : '';
   if (!email) return null;
 
-  return { sub: claims.sub, email, name: claims.name ?? email };
+  const emailVerified =
+    claims.tid?.toLowerCase() === MICROSOFT_CONSUMER_TENANT ||
+    claims.xms_edov === true ||
+    claims.xms_edov === 'true' ||
+    claims.xms_edov === '1';
+  // Left unset rather than false: a tenant-locked app already trusts every
+  // address its directory asserts (verifiesEmailDomain).
+  return {
+    sub: claims.sub,
+    email,
+    name: claims.name ?? email,
+    ...(emailVerified ? { emailVerified } : {}),
+  };
 }
+
+/** The fixed tenant every personal (outlook.com, hotmail.com…) Microsoft account signs in under. */
+export const MICROSOFT_CONSUMER_TENANT = '9188040d-6c67-4c5b-b112-36a304b66dad';
 
 /**
  * A tenant GUID (or domain) locks sign-in to one directory, whose admin is

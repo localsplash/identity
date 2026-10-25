@@ -8,7 +8,7 @@ import {
   savePhoneNumber,
   phoneNumberInput,
 } from "./phoneNumbers";
-import { manageMember } from "./memberManagement";
+import { manageMember, removeMember } from "./memberManagement";
 import { emitEvent } from "./webhooks";
 
 type Trust = (req: express.Request, res: express.Response) => Promise<unknown>;
@@ -297,12 +297,26 @@ export function installPlatformRoutes(
         })
         .strict()
         .parse(req.body);
-      await manageMember(db, session, id, userId, body);
+      const result = await manageMember(db, session, id, userId, body);
+      if (result.mergedFromUserId)
+        await emitEvent(db, "user.merged", {
+          fromUserId: result.mergedFromUserId,
+          toUserId: result.iUserId,
+        });
       res.json(
         (await platform.listMemberships(db, id)).find(
-          (m) => m.iUserId === userId,
+          (m) => m.iUserId === result.iUserId,
         ),
       );
+    }),
+  );
+  router.delete(
+    "/directory/tenants/:id/memberships/:userId",
+    route(async (req, res) => {
+      const session = await actor(req),
+        id = platform.safeId(req.params.id),
+        userId = platform.safeId(req.params.userId);
+      res.json(await removeMember(db, session, id, userId));
     }),
   );
   router.post(
@@ -327,10 +341,20 @@ export function installPlatformRoutes(
         idempotencyKey: null,
         actorUserId: session.iUserId,
       });
-      await manageMember(db, session, id, user.iUserId, {
-        role: body.role,
-        bEnabled: body.bEnabled,
-      });
+      try {
+        await manageMember(
+          db,
+          session,
+          id,
+          user.iUserId,
+          { role: body.role, bEnabled: body.bEnabled },
+          { newMember: true },
+        );
+      } catch (e) {
+        // Don't leave behind an invitation this request just created.
+        if (!user.claimed) await store.deleteUserIfUnused(db, user.iUserId);
+        throw e;
+      }
       res
         .status(201)
         .json(
